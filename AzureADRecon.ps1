@@ -54,6 +54,21 @@
 .PARAMETER Credential
 	Domain Credentials.
 
+.PARAMETER AccessToken
+    Microsoft Graph Access Token (String or SecureString) to authenticate directly.
+
+.PARAMETER SeamlessSSO
+    Switch to authenticate via Azure AD Seamless Single Sign-On (Kerberos ticket for HTTP/autologon.microsoftazuread-sso.com).
+
+.PARAMETER TGT
+    Path to Kerberos ticket file (.ccache or .kirbi) or Base64 (nowrap) encoded ticket string for Seamless SSO.
+
+.PARAMETER Domain
+    Active Directory domain name (FQDN) for Kerberos/SeamlessSSO authentication.
+
+.PARAMETER DC
+    Domain Controller IP address or hostname for Kerberos authentication.
+
 .PARAMETER GenExcel
 	Path for AzureADRecon output folder containing the CSV files to generate the AzureADRecon-Report.xlsx. Use it to generate the AzureADRecon-Report.xlsx when Microsoft Excel is not installed on the host used to run AzureADRecon.
 
@@ -125,6 +140,21 @@ param
 
     [Parameter(Mandatory = $false, HelpMessage = "Azure Credentials.")]
     [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Microsoft Graph Access Token (String or SecureString).")]
+    $AccessToken,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Authenticate using Azure AD Seamless SSO (Kerberos ticket for HTTP/autologon.microsoftazuread-sso.com).")]
+    [switch] $SeamlessSSO,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Active Directory domain name (FQDN) for Kerberos/SeamlessSSO authentication.")]
+    [string] $Domain,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Domain Controller IP address or hostname for Kerberos authentication.")]
+    [string] $DC,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path to Kerberos ticket (.ccache or .kirbi) or Base64 (nowrap) encoded ticket string for Seamless SSO.")]
+    [string] $TGT,
 
     [Parameter(Mandatory = $false, HelpMessage = "Path for AzureADRecon output folder containing the CSV files to generate the AzureADRecon-Report.xlsx. Use it to generate the AzureADRecon-Report.xlsx when Microsoft Excel is not installed on the host used to run AzureADRecon.")]
     [string] $GenExcel,
@@ -3421,6 +3451,349 @@ Function Remove-EmptyAADROutputDir
     }
 }
 
+Function Get-AADRSeamlessSSOToken
+{
+<#
+.SYNOPSIS
+    Acquires an AccessToken for Microsoft Graph using Azure AD Seamless SSO (Kerberos HTTP/autologon.microsoftazuread-sso.com).
+
+.DESCRIPTION
+    Leverages domain-joined Windows Kerberos ticket authentication or Linux Kerberos tickets (TGT / ccache / kirbi)
+    against the Azure AD Seamless SSO endpoint (HTTP/autologon.microsoftazuread-sso.com).
+    Supports TGT/kirbi conversion, custom DC and Domain configuration, AADInternals, MSAL.PS, curl --negotiate,
+    or native WS-Trust / SAML bearer token exchange.
+
+.PARAMETER TenantID
+    Tenant ID or domain name.
+
+.PARAMETER Domain
+    Active Directory domain name (FQDN).
+
+.PARAMETER DC
+    Domain Controller IP or hostname.
+
+.PARAMETER TGT
+    Path to Kerberos ticket (.ccache or .kirbi).
+#>
+    param(
+        [Parameter(Mandatory = $false)]
+        [string] $TenantID,
+
+        [Parameter(Mandatory = $false)]
+        [string] $Domain,
+
+        [Parameter(Mandatory = $false)]
+        [string] $DC,
+
+        [Parameter(Mandatory = $false)]
+        [string] $TGT
+    )
+
+    Write-Output "[Invoke-AzureADRecon] Attempting Seamless SSO (Kerberos HTTP/autologon.microsoftazuread-sso.com)..."
+
+    $tempFilesToClean = [System.Collections.Generic.List[string]]::new()
+
+    Try
+    {
+        # --- Handle Ticket / TGT on Linux/Windows ---
+        If (-Not [string]::IsNullOrEmpty($TGT))
+        {
+            $resolvedTGT = $TGT
+            $isBase64Ticket = $false
+            $ticketBytes = $null
+
+            If (Test-Path $TGT)
+            {
+                $resolvedTGT = (Resolve-Path $TGT).Path
+            }
+            Else
+            {
+                # Try decoding as Base64 (e.g. Rubeus /nowrap base64 ticket)
+                $trimmedTGT = $TGT.Trim() -replace '\s+', ''
+                Try
+                {
+                    $ticketBytes = [System.Convert]::FromBase64String($trimmedTGT)
+                    If ($ticketBytes -and $ticketBytes.Length -gt 16)
+                    {
+                        $isBase64Ticket = $true
+                    }
+                }
+                Catch {}
+
+                If ($isBase64Ticket)
+                {
+                    Write-Output "[Invoke-AzureADRecon] Detected Base64-encoded Kerberos ticket."
+                    # Determine extension: 0x76 (ASN.1 tag 22) is KRB-CRED (.kirbi), else .ccache
+                    $ext = If ($ticketBytes[0] -eq 0x76) { ".kirbi" } Else { ".ccache" }
+                    $tempTicketPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "ticket_$([System.Guid]::NewGuid().ToString('N'))$ext")
+                    [System.IO.File]::WriteAllBytes($tempTicketPath, $ticketBytes)
+                    $tempFilesToClean.Add($tempTicketPath)
+                    $resolvedTGT = $tempTicketPath
+                }
+            }
+
+            If (Test-Path $resolvedTGT)
+            {
+                # Check if it is a .kirbi ticket (Windows KRB-CRED format)
+                $isKirbi = $resolvedTGT.ToLower().EndsWith(".kirbi")
+                If (-Not $isKirbi)
+                {
+                    Try
+                    {
+                        $firstByte = [System.IO.File]::ReadAllBytes($resolvedTGT)[0]
+                        If ($firstByte -eq 0x76) { $isKirbi = $true }
+                    }
+                    Catch {}
+                }
+
+                If ($isKirbi)
+                {
+                    Write-Output "[Invoke-AzureADRecon] Detected .kirbi Kerberos ticket."
+                    # If running on Linux/macOS or using GSSAPI, convert .kirbi to .ccache
+                    If ($PSVersionTable.Platform -ne "Win32NT")
+                    {
+                        $ccachePath = [System.IO.Path]::ChangeExtension($resolvedTGT, ".ccache")
+                        $tempFilesToClean.Add($ccachePath)
+                        $converter = Get-Command "impacket-ticketConverter", "ticketConverter.py" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        If ($converter)
+                        {
+                            Write-Output "[Invoke-AzureADRecon] Converting Kirbi to ccache using $($converter.Name)..."
+                            & $converter.Name $resolvedTGT $ccachePath | Out-Null
+                            If (Test-Path $ccachePath)
+                            {
+                                $resolvedTGT = $ccachePath
+                            }
+                        }
+                        Else
+                        {
+                            Write-Warning "[Invoke-AzureADRecon] .kirbi format detected on Linux but 'impacket-ticketConverter' was not found in PATH."
+                            Write-Warning "[Invoke-AzureADRecon] If GSSAPI fails, convert it with: impacket-ticketConverter $resolvedTGT $ccachePath"
+                        }
+                    }
+                }
+
+                $env:KRB5CCNAME = $resolvedTGT
+                Write-Output "[Invoke-AzureADRecon] Set KRB5CCNAME to $resolvedTGT"
+            }
+            Else
+            {
+                Write-Warning "[Invoke-AzureADRecon] Specified TGT was not found as a valid file path or Base64 string."
+            }
+        }
+
+        # --- Handle Domain and DC configuration on Linux ---
+        If (-Not [string]::IsNullOrEmpty($Domain) -and -Not [string]::IsNullOrEmpty($DC))
+        {
+            $realmUpper = $Domain.ToUpper()
+            $tempKrb5 = [System.IO.Path]::GetTempFileName()
+            $tempFilesToClean.Add($tempKrb5)
+            $krb5ConfigContent = @"
+[libdefaults]
+    default_realm = $realmUpper
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+
+[realms]
+    $realmUpper = {
+        kdc = $DC
+        admin_server = $DC
+    }
+"@
+            [System.IO.File]::WriteAllText($tempKrb5, $krb5ConfigContent)
+            $env:KRB5_CONFIG = $tempKrb5
+            Write-Output "[Invoke-AzureADRecon] Configured Kerberos realm $realmUpper with KDC $DC"
+        }
+
+        # Strategy 1: AADInternals module if available
+        If (Get-Module -ListAvailable -Name AADInternals)
+        {
+            Try
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Using AADInternals for Seamless SSO token acquisition..."
+                Import-Module AADInternals -ErrorAction Stop
+                $tokenParam = @{}
+                If (-Not [string]::IsNullOrEmpty($TenantID)) { $tokenParam['Tenant'] = $TenantID }
+                If (-Not [string]::IsNullOrEmpty($Domain)) { $tokenParam['Domain'] = $Domain }
+                If (-Not [string]::IsNullOrEmpty($resolvedTGT) -and (Test-Path $resolvedTGT))
+                {
+                    $tokenParam['KerberosTicket'] = [System.IO.File]::ReadAllBytes($resolvedTGT)
+                }
+                $tokenObj = Get-AADIntAccessTokenForMSGraph @tokenParam -ErrorAction Stop
+                If ($tokenObj)
+                {
+                    If ($tokenObj -is [string]) { return $tokenObj }
+                    If ($tokenObj.access_token) { return $tokenObj.access_token }
+                }
+            }
+            Catch
+            {
+                Write-Verbose "[Invoke-AzureADRecon] AADInternals token acquisition failed: $($_.Exception.Message)"
+            }
+        }
+
+        # Strategy 2: MSAL.PS module if available
+        If (Get-Module -ListAvailable -Name MSAL.PS)
+        {
+            Try
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Using MSAL.PS Integrated Windows Authentication..."
+                Import-Module MSAL.PS -ErrorAction Stop
+                $msalParams = @{
+                    ClientId              = "14d82eec-204b-4c2f-b7e8-296a70dab67e" # Microsoft Graph PowerShell
+                    Scopes                = @("https://graph.microsoft.com/.default")
+                    IntegratedWindowsAuth = $true
+                }
+                If (-Not [string]::IsNullOrEmpty($TenantID)) { $msalParams['TenantId'] = $TenantID }
+                $msalRes = Get-MsalToken @msalParams -ErrorAction Stop
+                If ($msalRes.AccessToken)
+                {
+                    return $msalRes.AccessToken
+                }
+            }
+            Catch
+            {
+                Write-Verbose "[Invoke-AzureADRecon] MSAL.PS IWA acquisition failed: $($_.Exception.Message)"
+            }
+        }
+
+        # Strategy 3: Az.Accounts if session already exists
+        If (Get-Module -ListAvailable -Name Az.Accounts)
+        {
+            Try
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Checking Az.Accounts for MSGraph access token..."
+                Import-Module Az.Accounts -ErrorAction Stop
+                $azToken = Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop
+                If ($azToken.Token)
+                {
+                    return $azToken.Token
+                }
+            }
+            Catch
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Az.Accounts token acquisition failed: $($_.Exception.Message)"
+            }
+        }
+
+        # Strategy 4: Linux curl --negotiate or Windows WS-Trust request
+        $realm = If (-Not [string]::IsNullOrEmpty($TenantID)) { $TenantID } ElseIf (-Not [string]::IsNullOrEmpty($Domain)) { $Domain } Else { "common" }
+        $endpoint = "https://autologon.microsoftazuread-sso.com/$realm/winauth/trust/2005/windowstransport"
+
+        $rstXml = @"
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
+  <s:Header>
+    <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue</a:Action>
+    <a:To s:mustUnderstand="1">$endpoint</a:To>
+  </s:Header>
+  <s:Body>
+    <t:RequestSecurityToken xmlns:t="http://schemas.xmlsoap.org/ws/2005/02/trust">
+      <wsp:AppliesTo xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy">
+        <a:EndpointReference>
+          <a:Address>urn:federation:MicrosoftOnline</a:Address>
+        </a:EndpointReference>
+      </wsp:AppliesTo>
+      <t:KeyType>http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey</t:KeyType>
+      <t:RequestType>http://schemas.xmlsoap.org/ws/2005/02/trust/Issue</t:RequestType>
+      <t:TokenType>urn:oasis:names:tc:SAML:1.0:assertion</t:TokenType>
+    </t:RequestSecurityToken>
+  </s:Body>
+</s:Envelope>
+"@
+
+        $responseXml = $null
+
+        # If on Linux or non-Windows, or curl is available and KRB5CCNAME is set, use curl with --negotiate
+        $curlCmd = Get-Command "curl" -ErrorAction SilentlyContinue
+        If ($curlCmd -and ($PSVersionTable.Platform -ne "Win32NT" -or -Not [string]::IsNullOrEmpty($env:KRB5CCNAME)))
+        {
+            Try
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Executing curl with --negotiate using Kerberos cache..."
+                $tempReq = [System.IO.Path]::GetTempFileName()
+                $tempFilesToClean.Add($tempReq)
+                [System.IO.File]::WriteAllText($tempReq, $rstXml)
+
+                $curlOutput = & curl -s --negotiate -u : -X POST "$endpoint" -H "Content-Type: application/soap+xml; charset=utf-8" --data-binary "@$tempReq"
+                If (-Not [string]::IsNullOrEmpty($curlOutput) -and $curlOutput.Contains("Assertion"))
+                {
+                    $responseXml = $curlOutput
+                }
+            }
+            Catch
+            {
+                Write-Verbose "[Invoke-AzureADRecon] curl --negotiate exchange error: $($_.Exception.Message)"
+            }
+        }
+
+        # Fallback to .NET HttpWebRequest with UseDefaultCredentials (for Windows SSPI or .NET GSSAPI)
+        If ([string]::IsNullOrEmpty($responseXml))
+        {
+            Try
+            {
+                Write-Verbose "[Invoke-AzureADRecon] Performing .NET HttpWebRequest Kerberos exchange..."
+                $request = [System.Net.HttpWebRequest]::Create($endpoint)
+                $request.Method = "POST"
+                $request.ContentType = "application/soap+xml; charset=utf-8"
+                $request.UseDefaultCredentials = $true
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($rstXml)
+                $request.ContentLength = $bytes.Length
+
+                $requestStream = $request.GetRequestStream()
+                $requestStream.Write($bytes, 0, $bytes.Length)
+                $requestStream.Close()
+
+                $response = $request.GetResponse()
+                $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+                $responseXml = $reader.ReadToEnd()
+                $reader.Close()
+                $response.Close()
+            }
+            Catch
+            {
+                Write-Verbose "[Invoke-AzureADRecon] .NET HttpWebRequest exchange error: $($_.Exception.Message)"
+            }
+        }
+
+        # Parse assertion from response
+        If (-Not [string]::IsNullOrEmpty($responseXml))
+        {
+            $xmlDoc = [xml]$responseXml
+            $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+            $nsMgr.AddNamespace("saml", "urn:oasis:names:tc:SAML:1.0:assertion")
+            $assertionNode = $xmlDoc.SelectSingleNode("//saml:Assertion", $nsMgr)
+
+            If ($assertionNode)
+            {
+                $assertionBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($assertionNode.OuterXml))
+                $tokenBody = @{
+                    grant_type = "urn:ietf:params:oauth:grant-type:saml1_1-bearer"
+                    assertion  = $assertionBase64
+                    resource   = "https://graph.microsoft.com"
+                    client_id  = "14d82eec-204b-4c2f-b7e8-296a70dab67e" # Microsoft Graph PowerShell
+                }
+                $tokenRes = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$realm/oauth2/token" -Method POST -Body $tokenBody -ErrorAction Stop
+                If ($tokenRes.access_token)
+                {
+                    Write-Output "[Invoke-AzureADRecon] Successfully acquired token via Seamless SSO Kerberos exchange."
+                    return $tokenRes.access_token
+                }
+            }
+        }
+    }
+    Finally
+    {
+        ForEach ($f in $tempFilesToClean)
+        {
+            If (Test-Path $f) { Remove-Item -Path $f -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    Write-Warning "[Invoke-AzureADRecon] Seamless SSO / Kerberos ticket authentication failed."
+    Write-Warning "[Invoke-AzureADRecon] Ensure the TGT/ccache ticket is valid, line-of-sight to the DC (port 88) exists, and SPN HTTP/autologon.microsoftazuread-sso.com is accessible."
+    Write-Warning "[Invoke-AzureADRecon] Alternatively, acquire an access token manually and pass it using -AccessToken."
+    return $null
+}
+
 Function Get-AADRAbout
 {
 <#
@@ -3485,9 +3858,25 @@ Function Get-AADRAbout
     {
         $Username = $($Credential.UserName)
     }
-    ElseIf ($Method -eq "MSGraph" -and (-Not ([string]::IsNullOrEmpty((Get-MgContext).Account)) ) )
+    ElseIf ($Method -eq "MSGraph")
     {
-        $Username = (Get-MgContext).Account
+        $mgContext = Get-MgContext -ErrorAction SilentlyContinue
+        If ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.Account)))
+        {
+            $Username = $mgContext.Account
+        }
+        ElseIf ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.AppName)))
+        {
+            $Username = $mgContext.AppName
+        }
+        ElseIf ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.ClientId)))
+        {
+            $Username = $mgContext.ClientId
+        }
+        Else
+        {
+            $Username = $([Environment]::UserName)
+        }
     }
     Else
     {
@@ -3568,6 +3957,24 @@ Function Invoke-AzureADRecon
 
         [Parameter(Mandatory = $false)]
         [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty,
+
+        [Parameter(Mandatory = $false)]
+        $AccessToken,
+
+        [Parameter(Mandatory = $false)]
+        [switch] $SeamlessSSO,
+
+        [Parameter(Mandatory = $false)]
+        [string] $TenantID,
+
+        [Parameter(Mandatory = $false)]
+        [string] $Domain,
+
+        [Parameter(Mandatory = $false)]
+        [string] $DC,
+
+        [Parameter(Mandatory = $false)]
+        [string] $TGT,
 
         [Parameter(Mandatory = $true)]
         [array] $OutputType,
@@ -3945,60 +4352,76 @@ Function Invoke-AzureADRecon
             {
                 $CredsObj = Import-CSV -Path $ADFileName
                 Remove-Variable ADFileName
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[0].Value)) )
+                ForEach ($row in $CredsObj)
                 {
-                    $TenantID = $CredsObj[0].Value
+                    Switch ($row.Category)
+                    {
+                        'TenantID' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($TenantID)) { $TenantID = $row.Value } }
+                        'ClientID' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $ClientID = $row.Value } }
+                        'ClientSecret' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $ClientSecret = $row.Value; $HasClientSecret = $true } }
+                        'AccessToken' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($AccessToken)) { $AccessToken = $row.Value } }
+                        'SeamlessSSO' { If (($row.Value -eq 'true' -or $row.Value -eq '1') -and -Not $SeamlessSSO) { $SeamlessSSO = $true } }
+                        'Domain' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($Domain)) { $Domain = $row.Value } }
+                        'DC' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($DC)) { $DC = $row.Value } }
+                        'TGT' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($TGT)) { $TGT = $row.Value } }
+                        'CertificateThumbprint' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $CertificateThumbprint = $row.Value; $CertThumbprint = $true } }
+                        'CertificateName' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $CertificateName = $row.Value; $CertName = $true } }
+                        'Certificate' {
+                            If (-Not [string]::IsNullOrEmpty($row.Value)) {
+                                $Certificate = Get-ChildItem "Cert:\LocalMachine\My\$($row.Value)"
+                                $CertAuth = $true
+                            }
+                        }
+                    }
                 }
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[1].Value)) )
-                {
-                    $ClientID = $CredsObj[1].Value
-                }
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[2].Value)) )
+
+                # Backwards-compatibility for older CSV format by index if Category didn't match
+                If ([string]::IsNullOrEmpty($ClientSecret) -and $CredsObj.Count -gt 2 -and (-Not [string]::IsNullOrEmpty($CredsObj[2].Value)) -and $CredsObj[2].Category -eq 'ClientSecret')
                 {
                     $ClientSecret = $CredsObj[2].Value
-                    $AccessToken = $true
-                }
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[3].Value)) )
-                {
-                    $CertificateThumbprint = $CredsObj[3].Value
-                    $CertThumbprint = $true
-                }
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[4].Value)) )
-                {
-                    $CertificateName = $CredsObj[4].Value
-                    $CertName = $true
-                }
-                If (-Not ([string]::IsNullOrEmpty($CredsObj[5].Value)) )
-                {
-                    $Certificate = Get-ChildItem Cert:\LocalMachine\My\$CredsObj[5].Value
-                    $CertAuth = $true
+                    $HasClientSecret = $true
                 }
                 Remove-Variable CredsObj
             }
 
+            If ($SeamlessSSO)
+            {
+                $ssoToken = Get-AADRSeamlessSSOToken -TenantID $TenantID -Domain $Domain -DC $DC -TGT $TGT
+                If ($ssoToken)
+                {
+                    $AccessToken = $ssoToken
+                }
+                Else
+                {
+                    Write-Warning "[Invoke-AzureADRecon] Could not acquire Seamless SSO token ... Exiting"
+                    Return $null
+                }
+            }
+
             If ($AccessToken)
             {
-                #$body = @{
-                #    Grant_Type    = "client_credentials"
-                #    Scope         = "https://graph.microsoft.com/.default"
-                #    Client_Id     = $ClientID
-                #    Client_Secret = $ClientSecret
-                #}
-
-                #$connection = Invoke-RestMethod `
-                #    -Uri https://login.microsoftonline.com/$TenantID/oauth2/v2.0/token `
-                #    -Method POST `
-                #    -Body $body
-
-                # Convert to SecureString
+                Write-Output "[Invoke-AzureADRecon] Connecting to Microsoft Graph using AccessToken..."
+                If ($AccessToken -is [System.Security.SecureString])
+                {
+                    $secAccessToken = $AccessToken
+                }
+                Else
+                {
+                    $secAccessToken = ConvertTo-SecureString -String ([string]$AccessToken) -AsPlainText -Force
+                }
+                Connect-MgGraph -AccessToken $secAccessToken -NoWelcome | Out-Null
+                Remove-Variable AccessToken
+                Remove-Variable secAccessToken
+            }
+            ElseIf ($HasClientSecret)
+            {
+                Write-Output "[Invoke-AzureADRecon] Connecting to Microsoft Graph using ClientSecret..."
                 [SecureString]$secStringClientSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
                 [PSCredential]$ClientSecretCredential = New-Object System.Management.Automation.PSCredential ($ClientID, $secStringClientSecret)
-                Connect-MgGraph -TenantId $TenantID -ClientSecretCredential $ClientSecretCredential -NoWelcome
-                #Connect-MgGraph -AccessToken $($connection.access_token) | Out-Null
+                Connect-MgGraph -TenantId $TenantID -ClientSecretCredential $ClientSecretCredential -NoWelcome | Out-Null
                 Remove-Variable ClientID
                 Remove-Variable ClientSecret
-                Remove-Variable TenantID
-                Remove-Variable AccessToken
+                Remove-Variable HasClientSecret
                 Remove-Variable secStringClientSecret
                 Remove-Variable ClientSecretCredential
             }
@@ -4007,7 +4430,6 @@ Function Invoke-AzureADRecon
                 Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -CertificateThumbprint $CertificateThumbprint -Scopes $Scopes | Out-Null
                 Remove-Variable ClientID
                 Remove-Variable CertificateThumbprint
-                Remove-Variable TenantID
                 Remove-Variable CertThumbprint
             }
             ElseIf ($CertName)
@@ -4015,7 +4437,6 @@ Function Invoke-AzureADRecon
                 Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -CertificateName $CertificateName -Scopes $Scopes | Out-Null
                 Remove-Variable ClientID
                 Remove-Variable CertificateName
-                Remove-Variable TenantID
                 Remove-Variable CertName
             }
             ElseIf ($CertAuth)
@@ -4023,7 +4444,6 @@ Function Invoke-AzureADRecon
                 Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -Certificate $Certificate -Scopes $Scopes | Out-Null
                 Remove-Variable ClientID
                 Remove-Variable Certificate
-                Remove-Variable TenantID
                 Remove-Variable CertAuth
             }
             ElseIf ($TenantID)
@@ -4233,7 +4653,7 @@ If ($Log)
 
 #$Credential = New-Object System.Management.Automation.PSCredential ("Username", $(ConvertTo-SecureString "Password" -AsPlainText -Force))
 
-Invoke-AzureADRecon -GenExcel $GenExcel -Method $Method -Collect $Collect -Credential $Credential -OutputType $OutputType -AADROutputDir $OutputDir -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads -Logo $Logo
+Invoke-AzureADRecon -GenExcel $GenExcel -Method $Method -Collect $Collect -Credential $Credential -AccessToken $AccessToken -SeamlessSSO:$SeamlessSSO -TenantID $TenantID -Domain $Domain -DC $DC -TGT $TGT -OutputType $OutputType -AADROutputDir $OutputDir -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads -Logo $Logo
 
 If ($Log)
 {
