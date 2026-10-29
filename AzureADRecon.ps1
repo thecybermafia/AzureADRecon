@@ -57,11 +57,20 @@
 .PARAMETER AccessToken
     Microsoft Graph Access Token (String or SecureString) to authenticate directly.
 
+.PARAMETER AccessTokenProvider
+    Callback accepting a renewal request and returning one Graph token response with expiry metadata.
+
+.PARAMETER AccessTokenExpiresOn
+    UTC expiry date or Unix seconds for a supplied token without issuer expiry metadata.
+
+.PARAMETER TokenRefreshWindowSeconds
+    Renew supplied tokens this many seconds before expiry (60-900; default 300).
+
 .PARAMETER SeamlessSSO
     Switch to authenticate via Azure AD Seamless Single Sign-On (Kerberos ticket for HTTP/autologon.microsoftazuread-sso.com).
 
 .PARAMETER TGT
-    Path to Kerberos ticket file (.ccache or .kirbi) or Base64 (nowrap) encoded ticket string for Seamless SSO.
+    Kerberos ticket file or Base64 contents: KRB-CRED (.kirbi) on Windows; ccache on Linux/macOS.
 
 .PARAMETER Domain
     Active Directory domain name (FQDN) for Kerberos/SeamlessSSO authentication.
@@ -111,10 +120,10 @@
 
     Or
 
-    $username = "username@fqdn"
-    $passwd = ConvertTo-SecureString "PlainTextPassword" -AsPlainText -Force
+    $username = "00000000-0000-0000-0000-000000000001" # Application client ID
+    $passwd = ConvertTo-SecureString "ApplicationClientSecret" -AsPlainText -Force
     $creds = New-Object System.Management.Automation.PSCredential ($username, $passwd)
-	.\AzureADRecon.ps1 -Credential $creds
+	.\AzureADRecon.ps1 -Credential $creds -TenantID "<tenant-id>"
 
 .EXAMPLE
 
@@ -138,11 +147,26 @@ param
     [Parameter(Mandatory = $false, HelpMessage = "Which Tenant ID to connect to, picks up the default tenant ID if nothing specified")]
     [string] $TenantID,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Azure Credentials.")]
+    [Parameter(Mandatory = $false)]
+    [string] $ClientID,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $Resume,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Application client ID (GUID) and client secret as PSCredential; user/password sign-in is not supported.")]
     [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty,
 
     [Parameter(Mandatory = $false, HelpMessage = "Microsoft Graph Access Token (String or SecureString).")]
     $AccessToken,
+
+    [Parameter(Mandatory = $false)]
+    [scriptblock] $AccessTokenProvider,
+
+    [Parameter(Mandatory = $false)]
+    $AccessTokenExpiresOn,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(60, 900)] [int] $TokenRefreshWindowSeconds = 300,
 
     [Parameter(Mandatory = $false, HelpMessage = "Authenticate using Azure AD Seamless SSO (Kerberos ticket for HTTP/autologon.microsoftazuread-sso.com).")]
     [switch] $SeamlessSSO,
@@ -153,7 +177,7 @@ param
     [Parameter(Mandatory = $false, HelpMessage = "Domain Controller IP address or hostname for Kerberos authentication.")]
     [string] $DC,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Path to Kerberos ticket (.ccache or .kirbi) or Base64 (nowrap) encoded ticket string for Seamless SSO.")]
+    [Parameter(Mandatory = $false, HelpMessage = "Kerberos ticket file or Base64 contents: KRB-CRED (.kirbi) on Windows; ccache on Linux/macOS.")]
     [string] $TGT,
 
     [Parameter(Mandatory = $false, HelpMessage = "Path for AzureADRecon output folder containing the CSV files to generate the AzureADRecon-Report.xlsx. Use it to generate the AzureADRecon-Report.xlsx when Microsoft Excel is not installed on the host used to run AzureADRecon.")]
@@ -163,7 +187,7 @@ param
     [string] $OutputDir,
 
     [Parameter(Mandatory = $false, HelpMessage = "Which modules to run; Comma separated; e.g Tenant,Domain (Default all) Valid values include: Tenant, Domain, Licenses, Users, ServicePrincipals, DirectoryRoles, DirectoryRoleMembers, Groups, GroupMembers, Devices")]
-    [ValidateSet('Tenant', 'Domain', 'Licenses', 'Users', 'ServicePrincipals', 'DirectoryRoles', 'DirectoryRoleMembers', 'Groups', 'GroupMembers', 'Devices', 'Default')]
+    [ValidateSet('Tenant', 'Domain', 'Licenses', 'Users', 'ServicePrincipals', 'DirectoryRoles', 'DirectoryRoleMembers', 'Groups', 'GroupMembers', 'Devices', 'ConditionalAccessPolicies', 'Applications', 'ApplicationOwners', 'ServicePrincipalOwners', 'CredentialExpiry', 'ConsentGrants', 'ApplicationPermissions', 'PIMEligibility', 'MFARegistration', 'SecurityDefaults', 'AuthenticationMethodsPolicy', 'Default')]
     [array] $Collect = 'Default',
 
     [Parameter(Mandatory = $false, HelpMessage = "Output type; Comma seperated; e.g STDOUT,CSV,XML,JSON,HTML,Excel (Default STDOUT with -Collect parameter, else CSV and Excel)")]
@@ -179,7 +203,7 @@ param
     [int] $PassMaxAge = 90,
 
     [Parameter(Mandatory = $false, HelpMessage = "The PageSize to set for the MSGraph query. Default 200")]
-    [ValidateRange(1,10000)]
+    [ValidateRange(1,999)]
     [int] $PageSize = 200,
 
     [Parameter(Mandatory = $false, HelpMessage = "The number of threads to use during processing of objects. Default 10")]
@@ -193,6 +217,8 @@ param
     [ValidateSet('AzureADRecon', 'Payatu')]
     [string] $Logo = "AzureADRecon"
 )
+
+$script:AADRScriptPath = $PSCommandPath
 
 $MSGraphSource = @"
 // Thanks Dennis Albuquerque for the C# multithreading code
@@ -303,9 +329,9 @@ namespace AADRecon
         {
             foreach (PSObject AdLicense in AdLicenses)
             {
-                if (!AzureADClass.AzureSkuIDDictionary.ContainsKey(Convert.ToString(AdLicense.Members["SkuId"].Value)))
+                if (!AzureADClass.AzureSkuIDDictionary.ContainsKey(Convert.ToString(GetValue(AdLicense, "SkuId"))))
                 {
-                    AzureADClass.AzureSkuIDDictionary.Add(Convert.ToString(AdLicense.Members["SkuId"].Value),Convert.ToString(AdLicense.Members["SkuPartNumber"].Value));
+                    AzureADClass.AzureSkuIDDictionary.Add(Convert.ToString(GetValue(AdLicense, "SkuId")),Convert.ToString(GetValue(AdLicense, "SkuPartNumber")));
                 }
             }
         }
@@ -317,8 +343,47 @@ namespace AADRecon
             {"\"", "'"}
         };
 
+        private static object GetValue(PSObject record, string name)
+        {
+            if (record == null) return null;
+            var member = record.Members[name];
+            return member == null ? null : member.Value;
+        }
+
+        private static PSObject FailedRecord(object source, Exception error)
+        {
+            PSObject row = new PSObject();
+            object id = null;
+            object displayName = null;
+            try { id = GetValue(source as PSObject, "Id"); } catch { }
+            try { displayName = GetValue(source as PSObject, "DisplayName"); } catch { }
+            row.Members.Add(new PSNoteProperty("Id", id));
+            row.Members.Add(new PSNoteProperty("DisplayName", displayName));
+            row.Members.Add(new PSNoteProperty("CollectionStatus", "Unknown"));
+            row.Members.Add(new PSNoteProperty("CollectionError", error.GetType().FullName));
+            return row;
+        }
+
+        private static object GetDictionaryValue(object source, string key)
+        {
+            var dictionary = source as System.Collections.IDictionary;
+            return dictionary != null && dictionary.Contains(key) ? dictionary[key] : null;
+        }
+
+        private static string JoinValues(object source)
+        {
+            if (source == null) return null;
+            var values = source as System.Collections.IEnumerable;
+            if (values == null || source is string) return CleanString(source);
+            var result = new List<string>();
+            foreach (var value in values)
+                if (value != null) result.Add(CleanString(value));
+            return string.Join(",", result.ToArray());
+        }
+
         public static string CleanString(Object StringtoClean)
         {
+            if (StringtoClean == null) return null;
             // Remove extra spaces and new lines
             string CleanedString = string.Join(" ", ((Convert.ToString(StringtoClean)).Split((string[]) null, StringSplitOptions.RemoveEmptyEntries)));
             foreach (string Replacement in Replacements.Keys)
@@ -330,7 +395,7 @@ namespace AADRecon
 
         public static int ObjectCount(Object[] ADRObject)
         {
-            return ADRObject.Length;
+            return ADRObject == null ? 0 : ADRObject.Length;
         }
 
         public static Object[] TenantParser(Object[] AdTenant, int numOfThreads)
@@ -384,6 +449,8 @@ namespace AADRecon
 
         static Object[] runProcessor(Object[] arrayToProcess, int numOfThreads, string processorType)
         {
+            if (arrayToProcess == null || arrayToProcess.Length == 0) return new Object[0];
+            if (numOfThreads < 1) throw new ArgumentOutOfRangeException("numOfThreads");
             int totalRecords = arrayToProcess.Length;
             IRecordProcessor recordProcessor = recordProcessorFactory(processorType);
             IResultsHandler resultsHandler = new SimpleResultsHandler ();
@@ -458,8 +525,15 @@ namespace AADRecon
             {
                 for (int i = 0; i < objectsToBeProcessed.Length; i++)
                 {
-                    Object[] result = recordProcessor.processRecord(objectsToBeProcessed[i]);
-                    resultsHandler.processResults(result); //this is a thread safe operation
+                    try
+                    {
+                        Object[] result = recordProcessor.processRecord(objectsToBeProcessed[i]);
+                        resultsHandler.processResults(result); //this is a thread safe operation
+                    }
+                    catch (Exception error)
+                    {
+                        resultsHandler.processResults(new PSObject[] { FailedRecord(objectsToBeProcessed[i], error) });
+                    }
                 }
             }
         }
@@ -490,7 +564,7 @@ namespace AADRecon
                     string TechnicalNotificationMails = null;
 
                     Object[] ObjValues = new Object[]{
-                        "DisplayName", CleanString(AzureADTenant.Members["DisplayName"].Value)
+                        "DisplayName", CleanString(GetValue(AzureADTenant, "DisplayName"))
                     };
 
                     for (icount = 0; icount < ObjValues.Length; icount++)
@@ -502,9 +576,9 @@ namespace AADRecon
                         icount++;
                     }
 
-                    //if (((List<Microsoft.Open.AzureAD.Model.VerifiedDomain>) AzureADTenant.Members["VerifiedDomains"].Value).Count != 0)
+                    //if (((List<Microsoft.Open.AzureAD.Model.VerifiedDomain>) GetValue(AzureADTenant, "VerifiedDomains")).Count != 0)
                     //{
-                    //    VerifiedDomainsList = (List<Microsoft.Open.AzureAD.Model.VerifiedDomain>) AzureADTenant.Members["VerifiedDomains"].Value;
+                    //    VerifiedDomainsList = (List<Microsoft.Open.AzureAD.Model.VerifiedDomain>) GetValue(AzureADTenant, "VerifiedDomains");
                     //    count = 0;
                     //    foreach (Microsoft.Open.AzureAD.Model.VerifiedDomain value in VerifiedDomainsList)
                     //    {
@@ -528,27 +602,19 @@ namespace AADRecon
                     //    }
                     //}
 
-                    if (((List<string>) AzureADTenant.Members["TechnicalNotificationMails"].Value).Count != 0)
-                    {
-                        TechnicalNotificationMailsList = (List<string>) AzureADTenant.Members["TechnicalNotificationMails"].Value;
-                        foreach (string value in TechnicalNotificationMailsList)
-                        {
-                            TechnicalNotificationMails = TechnicalNotificationMails + "," + value;
-                        }
-                        TechnicalNotificationMails = TechnicalNotificationMails.TrimStart(',');
-                    }
+                    TechnicalNotificationMails = JoinValues(GetValue(AzureADTenant, "TechnicalNotificationMails"));
 
                     ObjValues = new Object[]{
-                        "DirSyncEnabled", AzureADTenant.Members["DirSyncEnabled"].Value,
-                        "CompanyLastDirSyncTime", AzureADTenant.Members["CompanyLastDirSyncTime"].Value,
-                        "Street", AzureADTenant.Members["Street"].Value,
-                        "City", AzureADTenant.Members["City"].Value,
-                        "PostalCode", AzureADTenant.Members["PostalCode"].Value,
-                        "State", AzureADTenant.Members["State"].Value,
-                        "Country", AzureADTenant.Members["Country"].Value,
-                        "CountryLetterCode", AzureADTenant.Members["CountryLetterCode"].Value,
+                        "DirSyncEnabled", GetValue(AzureADTenant, "DirSyncEnabled"),
+                        "CompanyLastDirSyncTime", GetValue(AzureADTenant, "CompanyLastDirSyncTime"),
+                        "Street", GetValue(AzureADTenant, "Street"),
+                        "City", GetValue(AzureADTenant, "City"),
+                        "PostalCode", GetValue(AzureADTenant, "PostalCode"),
+                        "State", GetValue(AzureADTenant, "State"),
+                        "Country", GetValue(AzureADTenant, "Country"),
+                        "CountryLetterCode", GetValue(AzureADTenant, "CountryLetterCode"),
                         "TechnicalNotificationMails", TechnicalNotificationMails,
-                        "TelephoneNumber", AzureADTenant.Members["TelephoneNumber"].Value
+                        "TelephoneNumber", GetValue(AzureADTenant, "TelephoneNumber")
                     };
                     for (icount = 0; icount < ObjValues.Length; icount++)
                     {
@@ -559,9 +625,9 @@ namespace AADRecon
                         icount++;
                     }
 
-                    //if (((List<Microsoft.Open.AzureAD.Model.AssignedPlan>) AzureADTenant.Members["AssignedPlans"].Value).Count != 0)
+                    //if (((List<Microsoft.Open.AzureAD.Model.AssignedPlan>) GetValue(AzureADTenant, "AssignedPlans")).Count != 0)
                     //{
-                    //    AssignedPlanList = (List<Microsoft.Open.AzureAD.Model.AssignedPlan>) AzureADTenant.Members["AssignedPlans"].Value;
+                    //    AssignedPlanList = (List<Microsoft.Open.AzureAD.Model.AssignedPlan>) GetValue(AzureADTenant, "AssignedPlans");
                     //    count = 0;
                     //    foreach (Microsoft.Open.AzureAD.Model.AssignedPlan value in AssignedPlanList)
                     //    {
@@ -584,8 +650,8 @@ namespace AADRecon
                     //}
 
                     ObjValues = new Object[]{
-                        "ObjectType", AzureADTenant.Members["ObjectType"].Value,
-                        "ObjectId", AzureADTenant.Members["ObjectId"].Value
+                        "ObjectType", GetValue(AzureADTenant, "ObjectType"),
+                        "ObjectId", GetValue(AzureADTenant, "ObjectId")
                     };
                     for (icount = 0; icount < ObjValues.Length; icount++)
                     {
@@ -600,8 +666,7 @@ namespace AADRecon
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -618,35 +683,27 @@ namespace AADRecon
                     string SupportedServices = null;
 
                     PSObject AzureADDomainObj = new PSObject();
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("Id", CleanString(AzureADDomain.Members["Id"].Value)));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("AuthenticationType", AzureADDomain.Members["authenticationType"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("AvailabilityStatus", AzureADDomain.Members["availabilityStatus"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("isAdminManaged", AzureADDomain.Members["isAdminManaged"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("isDefault", AzureADDomain.Members["isDefault"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("isInitial", AzureADDomain.Members["isInitial"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("isRoot", AzureADDomain.Members["isRoot"].Value));
-                    AzureADDomainObj.Members.Add(new PSNoteProperty("isVerified", AzureADDomain.Members["isVerified"].Value));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("Id", CleanString(GetValue(AzureADDomain, "Id"))));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("AuthenticationType", GetValue(AzureADDomain, "authenticationType")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("AvailabilityStatus", GetValue(AzureADDomain, "availabilityStatus")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("isAdminManaged", GetValue(AzureADDomain, "isAdminManaged")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("isDefault", GetValue(AzureADDomain, "isDefault")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("isInitial", GetValue(AzureADDomain, "isInitial")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("isRoot", GetValue(AzureADDomain, "isRoot")));
+                    AzureADDomainObj.Members.Add(new PSNoteProperty("isVerified", GetValue(AzureADDomain, "isVerified")));
 
-                    if (( (string[]) AzureADDomain.Members["SupportedServices"].Value).Length != 0)
-                    {
-                        foreach (string value in (string[]) AzureADDomain.Members["SupportedServices"].Value)
-                        {
-                            SupportedServices = SupportedServices + "," + value;
-                        }
-                        SupportedServices = SupportedServices.TrimStart(',');
-                    }
+                    SupportedServices = JoinValues(GetValue(AzureADDomain, "SupportedServices"));
                     AzureADDomainObj.Members.Add(new PSNoteProperty("SupportedServices", SupportedServices));
 
-                    //AzureADDomainObj.Members.Add(new PSNoteProperty("SupportedServices", AzureADDomain.Members["SupportedServices"].Value));
+                    //AzureADDomainObj.Members.Add(new PSNoteProperty("SupportedServices", GetValue(AzureADDomain, "SupportedServices")));
 
-                    //AzureADDomainObj.Members.Add(new PSNoteProperty("ForceDeleteState", AzureADDomain.Members["ForceDeleteState"].Value));
-                    //AzureADDomainObj.Members.Add(new PSNoteProperty("State", AzureADDomain.Members["State"].Value));
+                    //AzureADDomainObj.Members.Add(new PSNoteProperty("ForceDeleteState", GetValue(AzureADDomain, "ForceDeleteState")));
+                    //AzureADDomainObj.Members.Add(new PSNoteProperty("State", GetValue(AzureADDomain, "State")));
                     return new PSObject[] { AzureADDomainObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -664,16 +721,16 @@ namespace AADRecon
 
                     PSObject AzureADLicenseObj = new PSObject();
 
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("SkuPartNumber", AzureADLicense.Members["SkuPartNumber"].Value));
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("SkuId", AzureADLicense.Members["SkuId"].Value));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("SkuPartNumber", GetValue(AzureADLicense, "SkuPartNumber")));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("SkuId", GetValue(AzureADLicense, "SkuId")));
 
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("ConsumedUnits", AzureADLicense.Members["ConsumedUnits"].Value));
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("AppliesTo", AzureADLicense.Members["AppliesTo"].Value));
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("CapabilityStatus", AzureADLicense.Members["CapabilityStatus"].Value));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("ConsumedUnits", GetValue(AzureADLicense, "ConsumedUnits")));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("AppliesTo", GetValue(AzureADLicense, "AppliesTo")));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("CapabilityStatus", GetValue(AzureADLicense, "CapabilityStatus")));
 
-                    //if (((List<Microsoft.Open.AzureAD.Model.ServicePlanInfo>) AzureADLicense.Members["ServicePlans"].Value).Count != 0)
+                    //if (((List<Microsoft.Open.AzureAD.Model.ServicePlanInfo>) GetValue(AzureADLicense, "ServicePlans")).Count != 0)
                     //{
-                    //    ServicePlansList = (List<Microsoft.Open.AzureAD.Model.ServicePlanInfo>) AzureADLicense.Members["ServicePlans"].Value;
+                    //    ServicePlansList = (List<Microsoft.Open.AzureAD.Model.ServicePlanInfo>) GetValue(AzureADLicense, "ServicePlans");
                     //    foreach (Microsoft.Open.AzureAD.Model.ServicePlanInfo value in ServicePlansList)
                     //    {
                     //        ServicePlanName = ServicePlanName + "," + Convert.ToString(value.ServicePlanName);
@@ -681,18 +738,17 @@ namespace AADRecon
                     //    ServicePlanName = ServicePlanName.TrimStart(',');
                     //}
 
-                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Enabled", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) AzureADLicense.Members["PrepaidUnits"].Value).Enabled)));
-                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Suspended", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) AzureADLicense.Members["PrepaidUnits"].Value).Suspended)));
-                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Warning", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) AzureADLicense.Members["PrepaidUnits"].Value).Warning)));
+                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Enabled", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) GetValue(AzureADLicense, "PrepaidUnits")).Enabled)));
+                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Suspended", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) GetValue(AzureADLicense, "PrepaidUnits")).Suspended)));
+                    //AzureADLicenseObj.Members.Add(new PSNoteProperty("PrepaidUnits-Warning", (((Microsoft.Open.AzureAD.Model.LicenseUnitsDetail) GetValue(AzureADLicense, "PrepaidUnits")).Warning)));
                     //AzureADLicenseObj.Members.Add(new PSNoteProperty("ServicePlans-Name", ServicePlanName));
-                    AzureADLicenseObj.Members.Add(new PSNoteProperty("ObjectId", AzureADLicense.Members["ObjectId"].Value));
+                    AzureADLicenseObj.Members.Add(new PSNoteProperty("ObjectId", GetValue(AzureADLicense, "Id") ?? GetValue(AzureADLicense, "ObjectId")));
 
                     return new PSObject[] { AzureADLicenseObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -710,23 +766,23 @@ namespace AADRecon
                     //string AssignedLicensesName = null;
 
                     PSObject AzureADUserObj = new PSObject();
-                    AzureADUserObj.Members.Add(new PSNoteProperty("UserPrincipalName", CleanString(AzureAdUser.Members["UserPrincipalName"].Value)));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(AzureAdUser.Members["DisplayName"].Value)));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("Enabled", AzureAdUser.Members["AccountEnabled"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("UserType", AzureAdUser.Members["UserType"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("JobTitle", AzureAdUser.Members["JobTitle"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("Department", AzureAdUser.Members["Department"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("Mobile", AzureAdUser.Members["Mobile"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("TelephoneNumber", AzureAdUser.Members["TelephoneNumber"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("DirSyncEnabled", AzureAdUser.Members["DirSyncEnabled"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("OnPremisesSecurityIdentifier",  AzureAdUser.Members["OnPremisesSecurityIdentifier"] != null ? AzureAdUser.Members["OnPremisesSecurityIdentifier"].Value : null));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("OnPremisesDistinguishedName", CleanString(((Dictionary<string, string>) AzureAdUser.Members["ExtensionProperty"].Value)["onPremisesDistinguishedName"])));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("LastDirSyncTime", AzureAdUser.Members["LastDirSyncTime"].Value));
-                    AzureADUserObj.Members.Add(new PSNoteProperty("whenCreated", ((Dictionary<string, string>) AzureAdUser.Members["ExtensionProperty"].Value)["createdDateTime"]));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("UserPrincipalName", CleanString(GetValue(AzureAdUser, "UserPrincipalName"))));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(GetValue(AzureAdUser, "DisplayName"))));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("Enabled", GetValue(AzureAdUser, "AccountEnabled")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("UserType", GetValue(AzureAdUser, "UserType")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("JobTitle", GetValue(AzureAdUser, "JobTitle")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("Department", GetValue(AzureAdUser, "Department")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("Mobile", GetValue(AzureAdUser, "Mobile")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("TelephoneNumber", GetValue(AzureAdUser, "TelephoneNumber")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("DirSyncEnabled", GetValue(AzureAdUser, "DirSyncEnabled")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("OnPremisesSecurityIdentifier",  AzureAdUser.Members["OnPremisesSecurityIdentifier"] != null ? GetValue(AzureAdUser, "OnPremisesSecurityIdentifier") : null));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("OnPremisesDistinguishedName", CleanString(GetDictionaryValue(GetValue(AzureAdUser, "ExtensionProperty"), "onPremisesDistinguishedName"))));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("LastDirSyncTime", GetValue(AzureAdUser, "LastDirSyncTime")));
+                    AzureADUserObj.Members.Add(new PSNoteProperty("whenCreated", GetValue(AzureAdUser, "CreatedDateTime") ?? GetDictionaryValue(GetValue(AzureAdUser, "ExtensionProperty"), "createdDateTime")));
 
-                    //if (((List<Microsoft.Open.AzureAD.Model.AssignedLicense>) AzureAdUser.Members["AssignedLicenses"].Value).Count != 0)
+                    //if (((List<Microsoft.Open.AzureAD.Model.AssignedLicense>) GetValue(AzureAdUser, "AssignedLicenses")).Count != 0)
                     //{
-                    //    AssignedLicensesList = (List<Microsoft.Open.AzureAD.Model.AssignedLicense>) AzureAdUser.Members["AssignedLicenses"].Value;
+                    //    AssignedLicensesList = (List<Microsoft.Open.AzureAD.Model.AssignedLicense>) GetValue(AzureAdUser, "AssignedLicenses");
                     //    foreach (Microsoft.Open.AzureAD.Model.AssignedLicense value in AssignedLicensesList)
                     //    {
                     //        AssignedLicenses = AssignedLicenses + "," + Convert.ToString(value.SkuId);
@@ -736,7 +792,7 @@ namespace AADRecon
                     //    AssignedLicensesName = AssignedLicensesName.TrimStart(',');
                     //}
 
-                    //AzureADUserObj.Members.Add(new PSNoteProperty("Assigned Licenses (Count)", ((List<Microsoft.Open.AzureAD.Model.AssignedLicense>) AzureAdUser.Members["AssignedLicenses"].Value).Count));
+                    //AzureADUserObj.Members.Add(new PSNoteProperty("Assigned Licenses (Count)", ((List<Microsoft.Open.AzureAD.Model.AssignedLicense>) GetValue(AzureAdUser, "AssignedLicenses")).Count));
                     //AzureADUserObj.Members.Add(new PSNoteProperty("AssignedLicensesName", AssignedLicensesName));
                     //AzureADUserObj.Members.Add(new PSNoteProperty("AssignedLicenses", AssignedLicenses));
 
@@ -744,8 +800,7 @@ namespace AADRecon
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -760,94 +815,56 @@ namespace AADRecon
 
                     List<string> AADRList = new List<string>();
                     string AADRString = null;
-                    int AADRCount = 0;
                     //string AADRString2 = null;
                     //List<Microsoft.Open.AzureAD.Model.AppRole> AppRolesList = new List<Microsoft.Open.AzureAD.Model.AppRole>();
                     //List<Microsoft.Open.AzureAD.Model.OAuth2Permission> OAuth2PermissionList = new List<Microsoft.Open.AzureAD.Model.OAuth2Permission>();
 
                     PSObject AzureAdServicePrincipalObj = new PSObject();
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(AzureAdServicePrincipal.Members["DisplayName"].Value)));
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("Enabled", AzureAdServicePrincipal.Members["AccountEnabled"].Value));
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("PublisherName", AzureAdServicePrincipal.Members["PublisherName"].Value));
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("AppId", AzureAdServicePrincipal.Members["AppId"].Value));
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("ObjectId", AzureAdServicePrincipal.Members["ObjectId"].Value));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(GetValue(AzureAdServicePrincipal, "DisplayName"))));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("Enabled", GetValue(AzureAdServicePrincipal, "AccountEnabled")));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("PublisherName", GetValue(AzureAdServicePrincipal, "PublisherName")));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("AppId", GetValue(AzureAdServicePrincipal, "AppId")));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("ObjectId", GetValue(AzureAdServicePrincipal, "Id") ?? GetValue(AzureAdServicePrincipal, "ObjectId")));
 
                     AADRList = new List<string>();
                     AADRString = null;
-                    if (((List<string>) AzureAdServicePrincipal.Members["ServicePrincipalNames"].Value).Count != 0)
-                    {
-                        AADRList = (List<string>) AzureAdServicePrincipal.Members["ServicePrincipalNames"].Value;
-                        foreach (string value in AADRList)
-                        {
-                            AADRString = AADRString + "," + value;
-                        }
-                        AADRString = AADRString.TrimStart(',');
-                    }
+                    AADRString = JoinValues(GetValue(AzureAdServicePrincipal, "ServicePrincipalNames"));
                     AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("ServicePrincipalNames", AADRString));
 
                     AADRList = new List<string>();
                     AADRString = null;
-                    if (((List<string>) AzureAdServicePrincipal.Members["ReplyUrls"].Value).Count != 0)
-                    {
-                        AADRList = (List<string>) AzureAdServicePrincipal.Members["ReplyUrls"].Value;
-                        foreach (string value in AADRList)
-                        {
-                            AADRString = AADRString + "," + value;
-                        }
-                        AADRString = AADRString.TrimStart(',');
-                    }
+                    AADRString = JoinValues(GetValue(AzureAdServicePrincipal, "ReplyUrls"));
                     AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("ReplyUrls", AADRString));
 
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("LogoutUrl", AzureAdServicePrincipal.Members["LogoutUrl"].Value));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("LogoutUrl", GetValue(AzureAdServicePrincipal, "LogoutUrl")));
 
-                    AADRCount = 0;
-                    AADRString = null;
-                    //AADRString2 = null;
-                    //if (((List<Microsoft.Open.AzureAD.Model.AppRole>) AzureAdServicePrincipal.Members["AppRoles"].Value).Count != 0)
-                    //{
-                    //    AppRolesList = (List<Microsoft.Open.AzureAD.Model.AppRole>) AzureAdServicePrincipal.Members["AppRoles"].Value;
-                    //    AADRCount = AppRolesList.Count;
-                    //    foreach (Microsoft.Open.AzureAD.Model.AppRole value in AppRolesList)
-                    //    {
-                    //        AADRList = new List<string>();
-                    //        AADRString = null;
-                    //        if (((List<string>) value.AllowedMemberTypes).Count != 0)
-                    //        {
-                    //            AADRList = (List<string>) value.AllowedMemberTypes;
-                    //            foreach (string valuestring in AADRList)
-                    //            {
-                    //                AADRString = AADRString + "," + valuestring;
-                    //            }
-                    //            AADRString = AADRString.TrimStart(',');
-                    //        }
-                    //        AADRString2 = AADRString2 + AADRString + "," + value.Description + "," + value.Id + "," + value.IsEnabled + "," + value.Value + ",";
-                    //    }
-                    //    AADRString2 = AADRString2.TrimStart(',');
-                    //}
-                    //AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("AppRoles (Count)", AADRCount));
-                    //AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("AppRoles - AllowedMemberTypes,Description,Id,IsEnabled,Value", CleanString(AADRString2)));
-
-                    AADRCount = 0;
-                    AADRString = null;
-                    //if (((List<Microsoft.Open.AzureAD.Model.OAuth2Permission>) AzureAdServicePrincipal.Members["Oauth2Permissions"].Value).Count != 0)
-                    //{
-                    //    OAuth2PermissionList = (List<Microsoft.Open.AzureAD.Model.OAuth2Permission>) AzureAdServicePrincipal.Members["Oauth2Permissions"].Value;
-                    //    AADRCount = OAuth2PermissionList.Count;
-                    //    foreach (Microsoft.Open.AzureAD.Model.OAuth2Permission value in OAuth2PermissionList)
-                    //    {
-                    //        AADRString = AADRString + "," + value.AdminConsentDescription + "," + value.AdminConsentDisplayName + "," + value.Id + "," + value.IsEnabled + "," + value.Type + "," + value.UserConsentDescription + "," + value.UserConsentDisplayName + ","  + value.Value + ",";
-                    //    }
-                    //    AADRString = AADRString.TrimStart(',');
-                    //}
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("OAuth2Permissions (Count)", AADRCount));
-                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("OAuth2Permissions - AdminConsentDescription,AdminConsentDisplayName,Id,IsEnabled,Type,UserConsentDescription,UserConsentDisplayName,Value", CleanString(AADRString)));
+                    object scopeSource = GetValue(AzureAdServicePrincipal, "Oauth2PermissionScopes") ?? GetValue(AzureAdServicePrincipal, "Oauth2Permissions");
+                    object scopeCount = null;
+                    string scopeText = null;
+                    var scopes = scopeSource as System.Collections.IEnumerable;
+                    if (scopes != null)
+                    {
+                        var descriptions = new List<string>();
+                        int count = 0;
+                        foreach (object scope in scopes)
+                        {
+                            var item = PSObject.AsPSObject(scope);
+                            descriptions.Add(Convert.ToString(GetValue(item, "Id")) + ":" + Convert.ToString(GetValue(item, "Value")));
+                            count++;
+                        }
+                        scopeCount = count;
+                        scopeText = string.Join(",", descriptions.ToArray());
+                    }
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("Exposed OAuth2 Scopes (Count)", scopeCount));
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("Exposed OAuth2 Scopes", scopeText));
+                    // Backward-compatible count describes exposed scopes, never permission grants.
+                    AzureAdServicePrincipalObj.Members.Add(new PSNoteProperty("OAuth2Permissions (Count)", scopeCount));
 
                     return new PSObject[] { AzureAdServicePrincipalObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -861,18 +878,17 @@ namespace AADRecon
                     PSObject AzureADDirectoryRole = (PSObject) record;
 
                     PSObject AzureADDirectoryRoleObj = new PSObject();
-                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(AzureADDirectoryRole.Members["DisplayName"].Value)));
-                    //AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("RoleDisabled", AzureADDirectoryRole.Members["RoleDisabled"].Value));
-                    //AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("IsSystem", AzureADDirectoryRole.Members["IsSystem"].Value));
-                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("Description", CleanString(AzureADDirectoryRole.Members["Description"].Value)));
-                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("Id", AzureADDirectoryRole.Members["Id"].Value));
-                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("RoleTemplateId", AzureADDirectoryRole.Members["RoleTemplateId"].Value));
+                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(GetValue(AzureADDirectoryRole, "DisplayName"))));
+                    //AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("RoleDisabled", GetValue(AzureADDirectoryRole, "RoleDisabled")));
+                    //AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("IsSystem", GetValue(AzureADDirectoryRole, "IsSystem")));
+                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("Description", CleanString(GetValue(AzureADDirectoryRole, "Description"))));
+                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("Id", GetValue(AzureADDirectoryRole, "Id")));
+                    AzureADDirectoryRoleObj.Members.Add(new PSNoteProperty("RoleTemplateId", GetValue(AzureADDirectoryRole, "RoleTemplateId")));
                     return new PSObject[] { AzureADDirectoryRoleObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -886,18 +902,17 @@ namespace AADRecon
                     PSObject AzureADGroup = (PSObject) record;
 
                     PSObject AzureADGroupObj = new PSObject();
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(AzureADGroup.Members["DisplayName"].Value)));
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesSyncEnabled", AzureADGroup.Members["OnPremisesSyncEnabled"].Value));
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesLastSyncDateTime", AzureADGroup.Members["OnPremisesLastSyncDateTime"].Value));
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesSecurityIdentifier", AzureADGroup.Members["OnPremisesSecurityIdentifier"].Value));
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("SecurityEnabled", AzureADGroup.Members["SecurityEnabled"].Value));
-                    AzureADGroupObj.Members.Add(new PSNoteProperty("Description", CleanString(AzureADGroup.Members["Description"].Value)));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(GetValue(AzureADGroup, "DisplayName"))));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesSyncEnabled", GetValue(AzureADGroup, "OnPremisesSyncEnabled")));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesLastSyncDateTime", GetValue(AzureADGroup, "OnPremisesLastSyncDateTime")));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("OnPremisesSecurityIdentifier", GetValue(AzureADGroup, "OnPremisesSecurityIdentifier")));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("SecurityEnabled", GetValue(AzureADGroup, "SecurityEnabled")));
+                    AzureADGroupObj.Members.Add(new PSNoteProperty("Description", CleanString(GetValue(AzureADGroup, "Description"))));
                     return new PSObject[] { AzureADGroupObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -911,26 +926,25 @@ namespace AADRecon
                     PSObject AzureADDevice = (PSObject) record;
 
                     PSObject AzureADDeviceObj = new PSObject();
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(AzureADDevice.Members["DisplayName"].Value)));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("AccountEnabled", CleanString(AzureADDevice.Members["AccountEnabled"].Value)));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OnPremisesSyncEnabled", AzureADDevice.Members["OnPremisesSyncEnabled"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OnPremisesLastSyncDateTime", AzureADDevice.Members["OnPremisesLastSyncDateTime"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OperatingSystem", AzureADDevice.Members["OperatingSystem"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OperatingSystemVersion", AzureADDevice.Members["OperatingSystemVersion"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("ApproximateLastSignInDateTime", AzureADDevice.Members["ApproximateLastSignInDateTime"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("TrustType", AzureADDevice.Members["TrustType"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("ProfileType", AzureADDevice.Members["ProfileType"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("IsManaged", AzureADDevice.Members["IsManaged"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DeviceOwnership", AzureADDevice.Members["DeviceOwnership"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("EnrollmentProfileName", AzureADDevice.Members["EnrollmentProfileName"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("IsCompliant", AzureADDevice.Members["IsCompliant"].Value));
-                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DeviceId", AzureADDevice.Members["DeviceId"].Value));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DisplayName", CleanString(GetValue(AzureADDevice, "DisplayName"))));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("AccountEnabled", GetValue(AzureADDevice, "AccountEnabled")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OnPremisesSyncEnabled", GetValue(AzureADDevice, "OnPremisesSyncEnabled")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OnPremisesLastSyncDateTime", GetValue(AzureADDevice, "OnPremisesLastSyncDateTime")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OperatingSystem", GetValue(AzureADDevice, "OperatingSystem")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("OperatingSystemVersion", GetValue(AzureADDevice, "OperatingSystemVersion")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("ApproximateLastSignInDateTime", GetValue(AzureADDevice, "ApproximateLastSignInDateTime")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("TrustType", GetValue(AzureADDevice, "TrustType")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("ProfileType", GetValue(AzureADDevice, "ProfileType")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("IsManaged", GetValue(AzureADDevice, "IsManaged")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DeviceOwnership", GetValue(AzureADDevice, "DeviceOwnership")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("EnrollmentProfileName", GetValue(AzureADDevice, "EnrollmentProfileName")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("IsCompliant", GetValue(AzureADDevice, "IsCompliant")));
+                    AzureADDeviceObj.Members.Add(new PSNoteProperty("DeviceId", GetValue(AzureADDevice, "DeviceId")));
                     return new PSObject[] { AzureADDeviceObj };
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception caught: {0}", e);
-                    return new PSObject[] { };
+                    return new PSObject[] { FailedRecord(record, e) };
                 }
             }
         }
@@ -976,6 +990,658 @@ namespace AADRecon
 }
 "@
 
+Function Initialize-AADRParserType
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $Source)
+
+    # CLR types cannot be replaced or unloaded from the session. Reuse this source
+    # version, but give changed source a different namespace to avoid stale parsers.
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    Try
+    {
+        $hash = [BitConverter]::ToString($hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Source))).Replace('-', '')
+    }
+    Finally { $hasher.Dispose() }
+
+    $namespace = "AADRecon.V$hash"
+    $typeName = "$namespace.AzureADClass"
+    $parserType = $typeName -as [type]
+    If ($parserType) { return $parserType }
+
+    If ($Source -notmatch '(?m)^namespace AADRecon\s*$')
+    {
+        throw 'Parser source does not declare the expected AADRecon namespace.'
+    }
+    $versionedSource = $Source -replace '(?m)^namespace AADRecon\s*$', "namespace $namespace"
+    # Default framework references work on both Windows PowerShell 5.1 and Core.
+    # Compiling once avoids the former overlapping Core/CLR compilation branches.
+    $DebugPreference = 'SilentlyContinue'
+    Add-Type -TypeDefinition $versionedSource -ErrorAction Stop | Out-Null
+    $parserType = $typeName -as [type]
+    If (-Not $parserType) { throw 'Parser compilation did not load the expected class.' }
+    return $parserType
+}
+
+Function Join-AADRPath
+{
+    param([Parameter(Mandatory = $true)] [object[]] $Parts)
+    $path = [string]$Parts[0]
+    For ($i = 1; $i -lt $Parts.Count; $i++) { $path = Join-Path -Path $path -ChildPath ([string]$Parts[$i]) }
+    $path
+}
+
+Function ConvertTo-AADRDateTime
+{
+    param($Value)
+    If ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+    Try
+    {
+        If ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+        If ($Value -is [DateTime]) { return $Value.ToUniversalTime() }
+        return ([DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+    }
+    Catch
+    {
+        Add-AADREvent -Operation DateConversion -Status Unavailable -Detail 'A date field could not be parsed; it remains unknown.'
+        return $null
+    }
+}
+
+Function Get-AADRProperty
+{
+    param($Object, [string] $Name)
+    If ($null -eq $Object) { return $null }
+    If ($Object -is [System.Collections.IDictionary]) { return ,($Object[$Name]) }
+    $p = $Object.PSObject.Properties[$Name]
+    If ($p) { return ,($p.Value) }
+    return $null
+}
+
+Function Test-AADRGraphAuthenticationError
+{
+    param([Parameter(Mandatory = $true)] $Record)
+    If ($Record.FullyQualifiedErrorId -match 'AADRTokenVerificationFailed' -and $Record.Exception.Data['AADRSafeDiagnostic'])
+    { return $Record.Exception.Data['AADRSafeDiagnostic'].Category -eq 'AuthenticationFailed' }
+    $status = Get-AADRProperty $Record.Exception 'ResponseStatusCode'
+    If ($null -eq $status) { $status = Get-AADRProperty $Record.Exception 'StatusCode' }
+    If ($null -eq $status) { $status = Get-AADRProperty (Get-AADRProperty $Record.Exception 'Response') 'StatusCode' }
+    $details = @($Record.FullyQualifiedErrorId, $Record.Exception.Message, $Record.ErrorDetails.Message) -join ' '
+    return ([string]$status -in @('401', 'Unauthorized') -or
+        $details -match 'AADRGraphAuthenticationFailed|AADRTokenRenewalFailed|InvalidAuthenticationToken|ExpiredAuthenticationToken|Invalid token lifetime|AuthenticationFailed|token.*expired')
+}
+
+Function Stop-AADRGraphAuthentication
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] $Record)
+    If ($Record.FullyQualifiedErrorId -match 'AADRGraphAuthenticationFailed|AADRTokenRenewalFailed|AADRTokenVerificationFailed') { $PSCmdlet.ThrowTerminatingError($Record) }
+    # Do not include request headers, bearer tokens, or raw SDK exception details.
+    $message = 'Microsoft Graph rejected the authentication token (401). An invalid token lifetime can mean the token has expired or is not yet valid; check the system UTC clock. Automatic recovery was unavailable or the replacement was also rejected. Acquire a fresh Microsoft Graph token, configure AccessTokenProvider, use SeamlessSSO with a valid Kerberos session, or use SDK-managed interactive/certificate/application authentication. Completed collector checkpoints are retained. Resume requires the same identified Graph account/application, script, and settings; the failed collector restarts.'
+    $exception = New-Object System.Security.Authentication.AuthenticationException -ArgumentList $message
+    $exception.Data['AADRSafeDiagnostic'] = Get-AADRErrorDiagnostic $Record
+    $errorRecord = New-Object System.Management.Automation.ErrorRecord -ArgumentList $exception, 'AADRGraphAuthenticationFailed', ([System.Management.Automation.ErrorCategory]::AuthenticationError), $null
+    $PSCmdlet.ThrowTerminatingError($errorRecord)
+}
+
+Function Invoke-AADRReadRequest
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [scriptblock] $Query, [int] $MaxRetries = 3)
+    $authenticationRetried = $false
+    For ($attempt = 0; ; $attempt++)
+    {
+        Update-AADRTokenSession
+        Try { $result = @(& $Query); return $result }
+        Catch
+        {
+            $record = $_
+            If (Test-AADRGraphAuthenticationError -Record $record)
+            {
+                If (-Not $authenticationRetried -and $record.FullyQualifiedErrorId -notmatch 'AADRGraphAuthenticationFailed|AADRTokenRenewalFailed' -and
+                    $script:AADRTokenSession -and $script:AADRTokenSession.Ready -and $script:AADRTokenSession.Provider)
+                {
+                    $authenticationRetried = $true
+                    Update-AADRTokenSession -Force
+                    continue
+                }
+                Stop-AADRGraphAuthentication -Record $record
+            }
+            $status = Get-AADRProperty $record.Exception 'ResponseStatusCode'
+            If ($null -eq $status) { $status = Get-AADRProperty $record.Exception 'StatusCode' }
+            If ($null -eq $status) { $status = Get-AADRProperty (Get-AADRProperty $record.Exception 'Response') 'StatusCode' }
+            $details = @($record.FullyQualifiedErrorId, $record.Exception.Message, $record.ErrorDetails.Message) -join ' '
+            $transient = ([string]$status -in @('429','500','502','503','504','TooManyRequests','ServiceUnavailable','GatewayTimeout')) -or
+                ($details -match 'TooManyRequests|ServiceUnavailable|GatewayTimeout|InternalServerError')
+            If ($record.Exception.Data['AADRRetryExhausted']) { throw }
+            If (-Not $transient) { throw }
+            If ($attempt -ge $MaxRetries) { $record.Exception.Data['AADRRetryExhausted'] = $true; throw }
+            $delay = [Math]::Min(30, [Math]::Pow(2, $attempt + 1))
+            $headers = Get-AADRProperty (Get-AADRProperty $record.Exception 'Response') 'Headers'
+            If ($null -eq $headers) { $headers = Get-AADRProperty $record.Exception 'ResponseHeaders' }
+            $retryAfter = Get-AADRProperty $headers 'Retry-After'
+            $seconds = 0
+            If ($retryAfter)
+            {
+                $text = [string](@($retryAfter)[0])
+                $retryDate = [DateTimeOffset]::MinValue
+                If (-Not [int]::TryParse($text, [ref]$seconds) -and
+                    [DateTimeOffset]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$retryDate))
+                { $seconds = [int][Math]::Max(0, [Math]::Ceiling(($retryDate.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)) }
+            }
+            Else
+            {
+                $typedRetry = Get-AADRProperty $headers 'RetryAfter'
+                If ($typedRetry.Delta) { $seconds = [int][Math]::Ceiling($typedRetry.Delta.TotalSeconds) }
+                ElseIf ($typedRetry.Date) { $seconds = [int][Math]::Max(0, [Math]::Ceiling(($typedRetry.Date.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)) }
+            }
+            # Do not retry early when the server asks for more than the bounded wait.
+            If ($seconds -gt 60) { $record.Exception.Data['AADRRetryExhausted'] = $true; throw }
+            $delay = [Math]::Max($delay, $seconds)
+            Write-Verbose "Transient Graph failure; retry $($attempt + 1)/$MaxRetries in $delay seconds."
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+Function Get-AADRGraphObject
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    $uri = 'https://graph.microsoft.com/v1.0/' + $Path.TrimStart('/')
+    Invoke-AADRReadRequest -Query { Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop }
+}
+
+Function Get-AADRGraphPages
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    $uri = If ($Path.StartsWith('https://')) { $Path } Else { 'https://graph.microsoft.com/v1.0/' + $Path.TrimStart('/') }
+    $seen = @{}
+    $rows = New-Object System.Collections.Generic.List[object]
+    While ($uri)
+    {
+        $address = [uri]$uri
+        If ($address.Scheme -ne 'https' -or $address.Host -ne 'graph.microsoft.com' -or $address.Port -ne 443 -or $address.UserInfo)
+        { throw 'Unexpected Graph pagination host.' }
+        If ($seen.ContainsKey($uri)) { throw 'Graph returned a repeated pagination link.' }
+        $seen[$uri] = $true
+        $response = Invoke-AADRReadRequest -Query { Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop }
+        $value = Get-AADRProperty $response 'value'
+        If ($null -eq $value -and -Not ($response.PSObject.Properties['value'] -or ($response -is [System.Collections.IDictionary] -and $response.Contains('value'))))
+        { throw 'Graph collection response did not contain a value array.' }
+        ForEach ($row in $value) { If ($null -ne $row) { $rows.Add($row) } }
+        $uri = [string](Get-AADRProperty $response '@odata.nextLink')
+    }
+    $rows.ToArray()
+}
+
+Function Add-AADREvent
+{
+    param([string] $Operation, [string] $Status, [string] $Detail, $Diagnostic)
+    If ($script:AADRRun)
+    {
+        $event = [pscustomobject]@{TimeUtc=[DateTime]::UtcNow.ToString('o'); Collector=$script:AADRCurrentCollector; Operation=$Operation; Status=$Status; Detail=$Detail}
+        If ($null -ne $Diagnostic) { $event | Add-Member NoteProperty Diagnostic $Diagnostic }
+        $script:AADRRun.Events.Add($event)
+    }
+}
+
+Function Test-AADRControlFlowError
+{
+    param($Record)
+    $exception = $Record.Exception
+    For ($i=0; $null -ne $exception -and $i -lt 10; $i++)
+    {
+        If ($exception -is [System.Management.Automation.PipelineStoppedException] -or
+            $exception -is [System.OperationCanceledException] -or $exception -is [System.OutOfMemoryException]) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
+Function Get-AADRErrorDiagnostic
+{
+    param([Parameter(Mandatory = $true)] $Record)
+    If ($Record.FullyQualifiedErrorId -match 'AADRGraphAuthenticationFailed|AADRTokenRenewalFailed|AADRTokenVerificationFailed' -and $Record.Exception.Data['AADRSafeDiagnostic'])
+    { return $Record.Exception.Data['AADRSafeDiagnostic'] }
+    $status = Get-AADRProperty $Record.Exception 'ResponseStatusCode'
+    If ($null -eq $status) { $status = Get-AADRProperty $Record.Exception 'StatusCode' }
+    If ($null -eq $status) { $status = Get-AADRProperty (Get-AADRProperty $Record.Exception 'Response') 'StatusCode' }
+    $httpStatus = 0
+    Try { $httpStatus = [int]$status } Catch { $httpStatus = 0 }
+    $code = ([string]$Record.FullyQualifiedErrorId -split ',')[0]
+    # A PowerShell string throw uses the message itself as FullyQualifiedErrorId.
+    # Only known codes may be exposed; even a token-shaped string must stay private.
+    If ($code -notin @('AADRGraphAuthenticationFailed','AADRTokenRenewalFailed','InvalidAuthenticationToken','ExpiredAuthenticationToken','AuthenticationFailed','Authentication_RequestFromUnsupportedUserRole','Authorization_RequestDenied','Authorization_IdentityNotFound','AccessDenied','Forbidden','MissingPermission','NonPremiumTenant','Request_ResourceNotFound','ResourceNotFound','Request_BadRequest','BadRequest','TooManyRequests','ServiceUnavailable','GatewayTimeout','InternalServerError','FileOpenFailure','PathNotFound','UnauthorizedAccess','DirectoryNotFound','ParameterArgumentValidationError','ParameterBindingException'))
+    { $code = $Record.Exception.GetType().Name }
+    $reason = 'Unspecified'
+    $details = @($Record.FullyQualifiedErrorId, $Record.Exception.Message, $Record.ErrorDetails.Message) -join ' '
+    # Match known descriptions but emit only fixed labels, never the original text.
+    If ($details -match 'Invalid token lifetime') { $reason='InvalidTokenLifetime' }
+    ElseIf ($details -match 'token.*not yet valid|token.*not.*valid.*before|IDX10222') { $reason='TokenNotYetValid' }
+    ElseIf ($details -match 'token.*expired|IDX10223') { $reason='TokenExpired' }
+    ElseIf ($details -match 'token could not be read|Unable to decode|IDX12709|IDX14100') { $reason='UnreadableToken' }
+    ElseIf ($details -match 'Invalid audience|audience.*validation.*failed|IDX10214') { $reason='WrongAudience' }
+    ElseIf ($details -match 'No application to sign out from|No active (Graph )?(session|context)|not signed in') { $reason='NoActiveSession' }
+    ElseIf ($details -match 'insufficient privileges|Authorization_RequestDenied|AccessDenied|Forbidden') { $reason='InsufficientPermissions' }
+    $category = 'UnexpectedError'
+    $guidance = 'Inspect the failed operation and retry that dataset with -Resume after correcting the cause.'
+    If (Test-AADRControlFlowError $Record) { $category='Interrupted'; $guidance='Execution was cancelled or could not continue safely.' }
+    ElseIf (Test-AADRGraphAuthenticationError $Record) { $category='AuthenticationFailed'; $guidance='Renew the authentication source and resume with the same identity.' }
+    ElseIf (Test-AADRGraphPermissionError $Record) { $category='PermissionDenied'; $guidance='Check Graph permissions, delegated role, and required tenant licensing.' }
+    ElseIf (Test-AADRGraphNotFoundError $Record) { $category='NotFound'; $guidance='The referenced object or resource is unavailable; retain its known identity and retry if needed.' }
+    ElseIf ($httpStatus -eq 429 -or $code -match 'TooManyRequests') { $category='Throttled'; $guidance='Graph throttling persisted after bounded retries. Retry the affected dataset later.' }
+    ElseIf ($httpStatus -in @(500,502,503,504) -or $code -match 'ServiceUnavailable|GatewayTimeout|InternalServerError') { $category='ServiceUnavailable'; $guidance='Graph remained unavailable after bounded retries. Retry the affected dataset later.' }
+    ElseIf ($Record.Exception -is [System.IO.IOException] -or $Record.Exception -is [UnauthorizedAccessException] -or $Record.CategoryInfo.Category -in @('WriteError','PermissionDenied','ResourceUnavailable')) { $category='InputOutput'; $guidance='Check the file path, available disk space, permissions, and file locks.' }
+    ElseIf ($Record.Exception -is [System.Net.WebException] -or $Record.Exception -is [TimeoutException] -or $code -match 'HttpRequestException|Timeout|ConnectionError') { $category='NetworkError'; $guidance='Check network connectivity and retry the affected dataset.' }
+    ElseIf ($Record.CategoryInfo.Category -in @('InvalidArgument','InvalidData','ParserError') -or $Record.Exception -is [FormatException]) { $category='InvalidData'; $guidance='Check input values and the affected record. Unavailable values must remain unknown.' }
+    # Never persist raw exception messages, target objects, source lines, URLs, or headers.
+    If ($Record.Exception.Message -match 'initial manifest could not be saved|output directory already contains a run') { $guidance='Choose a new writable output directory, or use -Resume with the matching existing run.' }
+    ElseIf ($Record.Exception.Message -match 'Resume .*differ|Resume requires|Resume manifest') { $guidance='Resume requires the same verified identity, script, settings, and readable manifest. Use a new directory when these differ.' }
+    ElseIf ($Record.Exception.Message -match 'Install Microsoft.Graph') { $guidance='Install the Microsoft.Graph PowerShell module before running collection.' }
+    ElseIf ($Record.Exception.Message -match 'TenantID .*required|ClientID and TenantID .*required|-Credential requires') { $guidance='Check tenant ID, application client ID, and the chosen authentication parameters.' }
+    If ($reason -in @('InvalidTokenLifetime','TokenNotYetValid','TokenExpired')) { $guidance='Compare the machine UTC clock and token issuer expiry metadata. A new acquisition was attempted when supported; a repeated lifetime rejection requires correcting the token source or clock, not more retries.' }
+    ElseIf ($reason -eq 'UnreadableToken') { $guidance='The resource could not read the supplied token. Confirm the token source and Microsoft.Graph.Authentication module version; reissuing the same format may not help.' }
+    ElseIf ($reason -eq 'WrongAudience') { $guidance='Obtain a token for Microsoft Graph; tokens for Azure Resource Manager or Azure AD Graph cannot be used here.' }
+    $requestId = $null
+    $headers = Get-AADRProperty $Record.Exception 'ResponseHeaders'
+    If ($null -eq $headers) { $headers = Get-AADRProperty (Get-AADRProperty $Record.Exception 'Response') 'Headers' }
+    $headerValue = Get-AADRProperty $headers 'request-id'
+    $parsedId = [guid]::Empty
+    If ($headerValue -and [guid]::TryParse([string](@($headerValue)[0]), [ref]$parsedId)) { $requestId=$parsedId.ToString() }
+    [pscustomobject]@{Category=$category; Code=$code; Reason=$reason; Operation=$null; ExceptionType=$Record.Exception.GetType().FullName; HttpStatus=$(If ($httpStatus -gt 0) {$httpStatus} Else {$null}); RequestId=$requestId; ScriptLine=$Record.InvocationInfo.ScriptLineNumber; Guidance=$guidance}
+}
+
+Function Stop-AADRTokenVerification
+{
+    [CmdletBinding()]
+    param($Record, [ValidateSet('GraphConnection','OrganizationProbe','IdentityOrganization','IdentityUser','TokenMetadata')] [string] $Operation)
+    $diagnostic = Get-AADRErrorDiagnostic $Record
+    $diagnostic.Operation = $Operation
+    Add-AADREvent -Operation $Operation -Status $diagnostic.Category -Detail 'Startup/renewal verification failed. Token endpoint success does not establish Graph acceptance.' -Diagnostic $diagnostic
+    $exception = New-Object System.Security.Authentication.AuthenticationException -ArgumentList "Token verification failed at $Operation ($($diagnostic.Reason)). $($diagnostic.Guidance)"
+    $exception.Data['AADRSafeDiagnostic'] = $diagnostic
+    $record = New-Object System.Management.Automation.ErrorRecord -ArgumentList $exception, 'AADRTokenVerificationFailed', ([System.Management.Automation.ErrorCategory]::AuthenticationError), $null
+    $PSCmdlet.ThrowTerminatingError($record)
+}
+
+Function Disconnect-AADRGraphSession
+{
+    [CmdletBinding()]
+    param()
+    Try
+    {
+        # Failed verification may already have disconnected. No session is a
+        # successful cleanup, not another failure to show after the primary one.
+        If ((Get-Command Get-MgContext -ErrorAction SilentlyContinue) -and -Not (Get-MgContext -ErrorAction Stop)) { return }
+        Disconnect-MgGraph -ErrorAction Stop | Out-Null
+    }
+    Catch
+    {
+        $diagnostic = Get-AADRErrorDiagnostic $_
+        If ($diagnostic.Reason -eq 'NoActiveSession') { return }
+        $script:AADRCleanupFailed=$true
+        Add-AADREvent -Operation Cleanup -Status CleanupFailed -Detail 'Graph disconnect failed.' -Diagnostic $diagnostic
+        Write-Warning "[Cleanup] Graph disconnect failed ($($diagnostic.Code))." -WarningAction Continue
+    }
+}
+
+Function Invoke-AADRReportStep
+{
+    [CmdletBinding()]
+    param([string] $Name, [scriptblock] $Query)
+    $ErrorActionPreference = 'Stop'
+    Try { & $Query }
+    Catch
+    {
+        If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }
+        $diagnostic = Get-AADRErrorDiagnostic $_
+        Add-AADREvent -Operation $Name -Status ExportFailed -Detail 'Report operation failed; other outputs will still be attempted.' -Diagnostic $diagnostic
+        Write-Warning "[$Name] Report operation failed ($($diagnostic.Category)). Other outputs will continue." -WarningAction Continue
+    }
+}
+
+Function Write-AADRManifest
+{
+    [CmdletBinding()]
+    param([switch] $Required)
+    If (-Not $script:AADRRun) { return }
+    $path = Join-Path $script:AADRRun.OutputDirectory 'CollectionManifest.json'
+    $temp = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    Try
+    {
+        If (Test-Path -LiteralPath $path -PathType Container) { throw [System.IO.IOException]::new('The manifest path is a directory.') }
+        $script:AADRRun | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $temp -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $temp -Destination $path -Force -ErrorAction Stop
+    }
+    Catch
+    {
+        If (Test-AADRControlFlowError $_) { throw }
+        If (-Not $script:AADRManifestFailureRecorded)
+        {
+            $script:AADRManifestFailureRecorded = $true
+            Add-AADREvent -Operation Manifest -Status ManifestFailed -Detail 'Manifest could not be saved. Resume may be unavailable; report exports will still be attempted.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+            Write-Warning '[Manifest] Could not save collection status. Check the output path, disk space, permissions, and file locks. Resume may be unavailable.' -WarningAction Continue
+        }
+        If ($Required) { throw 'The initial manifest could not be saved. Choose a writable output directory before collecting.' }
+    }
+    Finally { If (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+}
+
+Function Get-AADRCollectionRegistry
+{
+    [ordered]@{
+        Tenant = { Get-AADRTenant -Method MSGraph -Threads $Threads }
+        Domain = { Get-AADRDomain -Method MSGraph -Threads $Threads }
+        Licenses = { Get-AADRLicense -Method MSGraph -Threads $Threads }
+        Users = { Get-AADRUser -Method MSGraph -date $date -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads }
+        ServicePrincipals = { Get-AADRServicePrincipal -Method MSGraph -date $date -Threads $Threads }
+        DirectoryRoles = { Get-AADRDirectoryRole -Method MSGraph -PageSize $PageSize -Threads $Threads }
+        DirectoryRoleMembers = { Get-AADRDirectoryRoleMember -Method MSGraph -PageSize $PageSize -Threads $Threads }
+        Groups = { Get-AADRGroup -Method MSGraph -date $date -PageSize $PageSize -Threads $Threads }
+        GroupMembers = { Get-AADRGroupMember -Method MSGraph -PageSize $PageSize -Threads $Threads }
+        Devices = { Get-AADRDevice -Method MSGraph -Threads $Threads }
+        ConditionalAccessPolicies = { Get-AADRConditionalAccessPolicy -Method MSGraph }
+        Applications = { Get-AADRApplicationInventory }
+        ApplicationOwners = { Get-AADRObjectOwners -Kind applications }
+        ServicePrincipalOwners = { Get-AADRObjectOwners -Kind servicePrincipals }
+        CredentialExpiry = { Get-AADRCredentialExpiry -date $date }
+        ConsentGrants = { Get-AADRConsentGrants }
+        ApplicationPermissions = { Get-AADRApplicationPermissions }
+        PIMEligibility = { Invoke-AADRGraphCollection -Name PIMEligibility -Query { Get-AADRGraphPages 'roleManagement/directory/roleEligibilityScheduleInstances' } }
+        MFARegistration = { Get-AADRMFARegistration | Select-Object id,userPrincipalName,userDisplayName,isMfaRegistered,isMfaCapable,isPasswordlessCapable,isSsprRegistered,isSsprEnabled,isSsprCapable,lastUpdatedDateTime,@{Name='MethodsRegistered';Expression={$_.methodsRegistered -join ', '}} }
+        SecurityDefaults = { Invoke-AADRGraphCollection -Name SecurityDefaults -Query { Get-AADRGraphObject 'policies/identitySecurityDefaultsEnforcementPolicy' } }
+        AuthenticationMethodsPolicy = { Invoke-AADRGraphCollection -Name AuthenticationMethodsPolicy -Query { Get-AADRGraphObject 'policies/authenticationMethodsPolicy' } }
+    }
+}
+
+Function Invoke-AADRQuery
+{
+    [CmdletBinding()]
+    param([scriptblock] $Query)
+    $ErrorActionPreference = 'Stop'
+    & $Query
+}
+
+Function Invoke-AADRCollectorRun
+{
+    [CmdletBinding()]
+    param([string] $Name, [scriptblock] $Query, [string] $OutputDirectory, [string[]] $Formats, [switch] $Resume)
+    $ErrorActionPreference = 'Stop'
+    $entry = [pscustomobject]@{Name=$Name; Status='Running'; DataStatus='Running'; RowCount=$null; StartedUtc=[DateTime]::UtcNow.ToString('o'); FinishedUtc=$null; Checkpoint=$null; CheckpointHash=$null; Resumed=$false; Exports=@(); Error=$null; Diagnostic=$null}
+    $script:AADRRun.Collectors.Add($entry)
+    $script:AADRCurrentCollector = $Name
+    $eventStart = $script:AADRRun.Events.Count
+    Try
+    {
+        Write-AADRManifest
+        $prior = @($script:AADRPreviousCollectors | Where-Object { $_.Name -eq $Name -and ($_.DataStatus -in @('Success','Empty') -or $_.Status -in @('Success','Empty')) } | Select-Object -Last 1)
+        $rows = @()
+        If ($Resume -and $prior.Count -eq 1 -and $prior[0].Checkpoint -and $prior[0].CheckpointHash)
+        {
+            Try
+            {
+                $cache = Join-AADRPath @($OutputDirectory, '.checkpoints', ($Name + '.clixml'))
+                If (-Not (Test-Path -LiteralPath $cache) -or (Get-FileHash -LiteralPath $cache -Algorithm SHA256 -ErrorAction Stop).Hash -ne $prior[0].CheckpointHash)
+                { throw 'Checkpoint integrity verification failed.' }
+                $cachedRows = Import-Clixml -LiteralPath $cache -ErrorAction Stop
+                $rows = @($cachedRows | Where-Object { $null -ne $_ })
+                $entry.Resumed = $true
+            }
+            Catch
+            {
+                If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }
+                Add-AADREvent -Operation Checkpoint -Status Recovered -Detail 'Checkpoint was missing, corrupt, or unreadable. It was rejected; this dataset will be recollected.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+                Write-Warning "[$Name] Checkpoint could not be verified. Recollecting this dataset." -WarningAction Continue
+            }
+        }
+        If (-Not $entry.Resumed)
+        {
+            $warnings = @()
+            $rows = @(Invoke-AADRQuery -Query $Query -WarningVariable +warnings | Where-Object { $null -ne $_ })
+            ForEach ($warning in $warnings) { Add-AADREvent -Operation $Name -Status Warning -Detail 'Collector emitted a warning; consult the console or transcript.' }
+        }
+        $entry.RowCount = $rows.Count
+        $events = @($script:AADRRun.Events | Select-Object -Skip $eventStart | Where-Object Status -notin @('TokenRenewed','Recovered'))
+        $entry.Status = If (@($events | Where-Object Status -eq 'PermissionDenied').Count -gt 0 -and $rows.Count -eq 0 -and @($events | Where-Object Status -eq 'Unavailable').Count -eq 0) { 'PermissionDenied' }
+            ElseIf ($events.Count -gt 0 -or @($rows | Where-Object { $_.CollectionStatus -eq 'Unknown' }).Count -gt 0) { 'Partial' }
+            ElseIf ($rows.Count -eq 0) { 'Empty' } Else { 'Success' }
+        $entry.DataStatus = $entry.Status
+        $unknownRows = @($rows | Where-Object { $_.CollectionStatus -eq 'Unknown' }).Count
+        If ($unknownRows -gt 0) { Add-AADREvent -Operation $Name -Status Unavailable -Detail "$unknownRows record(s) retain an unknown collection status." }
+        If ($entry.DataStatus -in @('Success','Empty'))
+        {
+            $temp = $null
+            Try
+            {
+                $cacheDir = Join-Path $OutputDirectory '.checkpoints'
+                $null = New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction Stop
+                $cache = Join-Path $cacheDir ($Name + '.clixml')
+                $temp = $cache + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+                Export-Clixml -InputObject $rows -LiteralPath $temp -Depth 20 -ErrorAction Stop
+                Move-Item -LiteralPath $temp -Destination $cache -Force -ErrorAction Stop
+                $entry.CheckpointHash = (Get-FileHash -LiteralPath $cache -Algorithm SHA256 -ErrorAction Stop).Hash
+                $entry.Checkpoint = Join-AADRPath @('.checkpoints', ($Name + '.clixml'))
+            }
+            Catch
+            {
+                If (Test-AADRControlFlowError $_) { throw }
+                $entry.Checkpoint = $null; $entry.CheckpointHash = $null; $entry.Status = 'Partial'
+                Add-AADREvent -Operation Checkpoint -Status CheckpointFailed -Detail 'Collected data could not be checkpointed; exports will still be attempted. This dataset must be recollected on resume.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+                Write-Warning "[$Name] Checkpoint could not be saved. Report exports will still be attempted." -WarningAction Continue
+            }
+            Finally { If ($temp -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+        }
+        If ($rows.Count -gt 0)
+        {
+            ForEach ($format in $Formats | Where-Object { $_ -ne 'EXCEL' })
+            {
+                $exportStart = $script:AADRRun.Events.Count
+                Try
+                {
+                    Export-ADR -ADRObj $rows -AADROutputDir $OutputDirectory -OutputType @($format) -ADRModuleName $Name -ErrorAction Stop
+                }
+                Catch
+                {
+                    If (Test-AADRControlFlowError $_) { throw }
+                    Add-AADREvent -Operation ($Name + ' ' + $format) -Status ExportFailed -Detail 'Export failed; remaining output formats will still be attempted.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+                    Write-Warning "[$Name] $format export failed. Remaining formats will continue." -WarningAction Continue
+                }
+                $failed = @($script:AADRRun.Events | Select-Object -Skip $exportStart | Where-Object Status -eq 'ExportFailed').Count -gt 0
+                $entry.Exports += [pscustomobject]@{Format=$format; Status=$(If ($failed) {'Failed'} Else {'Success'}); Path=$(If ($format -eq 'STDOUT') { $null } Else { Join-AADRPath @(($format + '-Files'), ($Name + '.' + $format.ToLowerInvariant())) })}
+                If ($failed) { $entry.Status = 'ExportFailed' }
+            }
+        }
+        Else
+        {
+            ForEach ($format in $Formats | Where-Object { $_ -ne 'EXCEL' })
+            { $entry.Exports += [pscustomobject]@{Format=$format; Status=$(If ($entry.DataStatus -eq 'Empty') { 'NotWrittenEmpty' } Else { 'Unavailable' }); Path=$null} }
+        }
+    }
+    Catch
+    {
+        $diagnostic = Get-AADRErrorDiagnostic $_
+        $entry.Status = If ($diagnostic.Category -eq 'PermissionDenied') { 'PermissionDenied' } Else { 'Failed' }
+        If ($entry.DataStatus -eq 'Running') { $entry.DataStatus = $entry.Status }
+        $entry.Error = $diagnostic.Category
+        $entry.Diagnostic = $diagnostic
+        Add-AADREvent -Operation $Name -Status $entry.Status -Detail 'Dataset did not complete; it must not be treated as empty or complete.' -Diagnostic $diagnostic
+        If (Test-AADRControlFlowError $_) { throw }
+        If (Test-AADRGraphAuthenticationError $_)
+        {
+            Add-AADREvent -Operation $Name -Status AuthenticationFailed -Detail 'Valid authentication could not be recovered. Collection stopped; completed checkpoints are retained.'
+            Stop-AADRGraphAuthentication -Record $_
+        }
+        Write-Warning "[$Name] Collection failed ($($diagnostic.Category)). Remaining collectors will continue. $($diagnostic.Guidance)" -WarningAction Continue
+    }
+    Finally
+    {
+        $entry.FinishedUtc = [DateTime]::UtcNow.ToString('o')
+        Try { Write-AADRManifest }
+        Finally { $script:AADRCurrentCollector = $null }
+    }
+}
+
+Function Get-AADRApplicationInventory
+{
+    [CmdletBinding()]
+    param()
+    $apps = @(Invoke-AADRGraphCollection -Name Applications -Query { Get-AADRGraphPages 'applications?$select=id,appId,displayName,createdDateTime,signInAudience,publisherDomain,requiredResourceAccess' })
+    ForEach ($app in $apps)
+    {
+        [pscustomobject][ordered]@{
+            Id=$app.id; AppId=$app.appId; DisplayName=$app.displayName; CreatedDateTime=$app.createdDateTime
+            SignInAudience=$app.signInAudience; PublisherDomain=$app.publisherDomain
+            RequestedResourceAccess=$(If ($null -ne $app.requiredResourceAccess) { ConvertTo-Json -InputObject $app.requiredResourceAccess -Depth 15 -Compress } Else { $null })
+        }
+    }
+}
+
+Function Get-AADRObjectOwners
+{
+    [CmdletBinding()]
+    param([ValidateSet('applications','servicePrincipals')] [string] $Kind)
+    $parents = @(Invoke-AADRGraphCollection -Name "$Kind owners parent list" -Query { Get-AADRGraphPages ($Kind + '?$select=id,appId,displayName') })
+    ForEach ($parent in $parents)
+    {
+        $state = @{}
+        $owners = @(Invoke-AADRGraphCollection -Name "$Kind owners" -State $state -Query { Get-AADRGraphPages ($Kind + '/' + [uri]::EscapeDataString($parent.id) + '/owners') })
+        If (-Not $state.Available)
+        {
+            [pscustomobject]@{ObjectId=$parent.id; ObjectName=$parent.displayName; ObjectType=$Kind; OwnerId=$null; OwnerName=$null; OwnerPrincipalName=$null; OwnerType=$null; CollectionStatus='Unknown'}
+        }
+        ForEach ($owner in $owners)
+        {
+            [pscustomobject]@{ObjectId=$parent.id; ObjectName=$parent.displayName; ObjectType=$Kind; OwnerId=$owner.id; OwnerName=$owner.displayName; OwnerPrincipalName=$owner.userPrincipalName; OwnerType=(Get-AADRProperty $owner '@odata.type'); CollectionStatus='Collected'}
+        }
+    }
+}
+
+Function Get-AADRCredentialExpiry
+{
+    [CmdletBinding()]
+    param([DateTime] $date = (Get-Date))
+    ForEach ($kind in @('applications','servicePrincipals'))
+    {
+        $objects = @(Invoke-AADRGraphCollection -Name "$kind credential metadata" -Query { Get-AADRGraphPages ($kind + '?$select=id,appId,displayName,passwordCredentials,keyCredentials') })
+        ForEach ($object in $objects)
+        {
+            ForEach ($property in @('passwordCredentials','keyCredentials'))
+            {
+                $credentials = Get-AADRProperty $object $property
+                If ($null -eq $credentials)
+                {
+                    Add-AADREvent -Operation CredentialExpiry -Status Unavailable -Detail 'Credential metadata was omitted for an object.'
+                    [pscustomobject]@{ObjectType=$kind; ObjectId=$object.id; AppId=$object.appId; ObjectName=$object.displayName; CredentialType=$property; KeyId=$null; DisplayName=$null; StartDateTime=$null; EndDateTime=$null; DaysToExpiry=$null; Expired=$null; CollectionStatus='Unknown'}
+                }
+                ForEach ($credential in $credentials)
+                {
+                    $end = If ($credential.endDateTime) { [DateTimeOffset]$credential.endDateTime } Else { $null }
+                    [pscustomobject]@{
+                        ObjectType=$kind; ObjectId=$object.id; AppId=$object.appId; ObjectName=$object.displayName
+                        CredentialType=$property; KeyId=$credential.keyId; DisplayName=$credential.displayName
+                        StartDateTime=$credential.startDateTime; EndDateTime=$credential.endDateTime
+                        DaysToExpiry=$(If ($null -ne $end) { [Math]::Floor(($end.UtcDateTime - $date.ToUniversalTime()).TotalDays) } Else { $null })
+                        Expired=$(If ($null -ne $end) { $end.UtcDateTime -lt $date.ToUniversalTime() } Else { $null })
+                        CollectionStatus='Collected'
+                    }
+                }
+            }
+        }
+    }
+}
+
+Function Get-AADRConsentGrants
+{
+    [CmdletBinding()]
+    param()
+    Invoke-AADRGraphCollection -Name ConsentGrants -Query { Get-AADRGraphPages 'oauth2PermissionGrants' } |
+        Select-Object id, clientId, resourceId, principalId, consentType, scope
+}
+
+Function Get-AADRApplicationPermissions
+{
+    [CmdletBinding()]
+    param()
+    $principals = @(Invoke-AADRGraphCollection -Name 'ApplicationPermissions service principals' -Query { Get-AADRGraphPages 'servicePrincipals?$select=id,appId,displayName,appRoles' })
+    $resourceMap = @{}
+    ForEach ($resource in $principals) { $resourceMap[[string]$resource.id] = $resource }
+    ForEach ($principal in $principals)
+    {
+        $state = @{}
+        $assignments = @(Invoke-AADRGraphCollection -Name 'ApplicationPermissions assignments' -State $state -Query { Get-AADRGraphPages ('servicePrincipals/' + [uri]::EscapeDataString($principal.id) + '/appRoleAssignments') })
+        If (-Not $state.Available)
+        {
+            [pscustomobject]@{ClientId=$principal.id; ClientAppId=$principal.appId; ClientName=$principal.displayName; AssignmentId=$null; ResourceId=$null; ResourceName=$null; AppRoleId=$null; PermissionValue=$null; PermissionDisplayName=$null; CollectionStatus='Unknown'}
+        }
+        ForEach ($assignment in $assignments)
+        {
+            # Assignment IDs describe granted application permissions, not exposed API scopes.
+            $resource = $resourceMap[[string]$assignment.resourceId]
+            $role = @($resource.appRoles | Where-Object { $_.id -eq $assignment.appRoleId } | Select-Object -First 1)
+            $permissionValue = If ($role.Count -gt 0) { $role[0].value } Else { $null }
+            $permissionName = If ($role.Count -gt 0) { $role[0].displayName } Else { $null }
+            [pscustomobject]@{ClientId=$principal.id; ClientAppId=$principal.appId; ClientName=$principal.displayName; AssignmentId=$assignment.id; ResourceId=$assignment.resourceId; ResourceName=$assignment.resourceDisplayName; AppRoleId=$assignment.appRoleId; PermissionValue=$permissionValue; PermissionDisplayName=$permissionName; CollectionStatus='Collected'}
+        }
+    }
+}
+
+Function Get-AADRMFARegistration
+{
+    [CmdletBinding()]
+    param()
+    If (-Not $script:AADRMFARegistrationLoaded)
+    {
+        $state = @{}
+        $script:AADRMFARegistrationRows = @(Invoke-AADRGraphCollection -Name MFARegistration -State $state -Query { Get-AADRGraphPages 'reports/authenticationMethods/userRegistrationDetails' })
+        $script:AADRMFARegistrationAvailable = $state.Available
+        $script:AADRMFARegistrationFailureStatus = $state.FailureStatus
+        $script:AADRMFARegistrationLoaded = $true
+    }
+    If (-Not $script:AADRMFARegistrationAvailable)
+    {
+        $failureStatus = If ($script:AADRMFARegistrationFailureStatus) { $script:AADRMFARegistrationFailureStatus } Else { 'Unavailable' }
+        Add-AADREvent -Operation MFARegistration -Status $failureStatus -Detail 'Registration/capability report is unavailable; registration remains unknown.'
+    }
+    $script:AADRMFARegistrationRows
+}
+
+Function Get-AADRGraphConnectionParameters
+{
+    [CmdletBinding()]
+    param([hashtable] $Config, [System.Management.Automation.PSCredential] $Credential, [string[]] $Scopes)
+    $connection = @{NoWelcome=$true; ContextScope='Process'; ErrorAction='Stop'}
+    If ($Config.TenantID) { $connection.TenantId = $Config.TenantID }
+    If ($Credential -and $Credential -ne [System.Management.Automation.PSCredential]::Empty)
+    {
+        $appId = [guid]::Empty
+        If (-Not [guid]::TryParse($Credential.UserName, [ref]$appId))
+        { throw '-Credential requires an application client ID (GUID) as username and client secret as password. User/password authentication is not supported by this parameter. Use interactive authentication for user sign-in.' }
+        If (-Not $Config.TenantID) { throw 'TenantID is required for application credential authentication.' }
+        $connection.ClientSecretCredential = $Credential
+    }
+    ElseIf ($Config.ClientSecret)
+    {
+        If (-Not $Config.ClientID -or -Not $Config.TenantID) { throw 'ClientID and TenantID are required with ClientSecret.' }
+        $connection.ClientSecretCredential = [System.Management.Automation.PSCredential]::new($Config.ClientID, (ConvertTo-SecureString $Config.ClientSecret -AsPlainText -Force))
+    }
+    ElseIf ($Config.CertificateThumbprint -or $Config.CertificateName -or $Config.Certificate)
+    {
+        If (-Not $Config.ClientID -or -Not $Config.TenantID) { throw 'ClientID and TenantID are required for certificate authentication.' }
+        $connection.ClientId = $Config.ClientID
+        If ($Config.CertificateThumbprint) { $connection.CertificateThumbprint = $Config.CertificateThumbprint }
+        ElseIf ($Config.CertificateName) { $connection.CertificateSubjectName = $Config.CertificateName }
+        Else { $connection.Certificate = Get-Item -LiteralPath ('Cert:\LocalMachine\My\' + $Config.Certificate) -ErrorAction Stop }
+    }
+    Else
+    {
+        $connection.Scopes = $Scopes
+        If ($Config.ClientID) { $connection.ClientId = $Config.ClientID }
+    }
+    $connection
+}
+
 Function Get-DateDiff
 {
 <#
@@ -1016,6 +1682,22 @@ Function Get-DateDiff
     Return $DDiff
 }
 
+Function Invoke-AADRAtomicFileWrite
+{
+    [CmdletBinding()]
+    param([string] $Path, [scriptblock] $Writer)
+    $ErrorActionPreference = 'Stop'
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $temp = $fullPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    Try
+    {
+        If (Test-Path -LiteralPath $fullPath -PathType Container) { throw [System.IO.IOException]::new('The report file path is a directory.') }
+        $null = & $Writer $temp
+        Move-Item -LiteralPath $temp -Destination $fullPath -Force -ErrorAction Stop
+    }
+    Finally { If (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+}
+
 Function Export-ADRCSV
 {
 <#
@@ -1048,12 +1730,33 @@ Function Export-ADRCSV
 
     Try
     {
-        $ADRObj | Export-Csv -Path $ADFileName -NoTypeInformation -Encoding Default
+        Invoke-AADRAtomicFileWrite -Path $ADFileName -Writer {
+            param($targetFile)
+            $columns = New-Object 'System.Collections.Generic.List[string]'
+            $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $flatRows = @($ADRObj | ForEach-Object {
+                $flat = [ordered]@{}
+                ForEach ($property in $_.PSObject.Properties)
+                {
+                    $value = $property.Value
+                    If ($null -ne $value -and $value -isnot [string] -and $value -isnot [ValueType])
+                    { $value = ConvertTo-Json -InputObject $value -Depth 20 -Compress -WarningAction Stop -ErrorAction Stop }
+                    $flat[$property.Name] = $value
+                    If ($seen.Add($property.Name)) { $columns.Add($property.Name) }
+                }
+                [pscustomobject]$flat
+            })
+            # Unknown marker rows can have fewer fields than collected rows. Preserve
+            # the union of columns regardless of which row happens to be first.
+            $flatRows | Select-Object -Property $columns.ToArray() | Export-Csv -LiteralPath $targetFile -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        }
     }
     Catch
     {
-        Write-Warning "[Export-ADRCSV] Failed to export $($ADFileName)."
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        If (Test-AADRControlFlowError $_) { throw }
+        Add-AADREvent -Operation 'Export-ADRCSV' -Status ExportFailed -Detail 'Output file could not be written.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning "[Export-ADRCSV] Failed to export $($ADFileName)." -WarningAction Continue
+
     }
 }
 
@@ -1089,12 +1792,17 @@ Function Export-ADRXML
 
     Try
     {
-        (ConvertTo-Xml -NoTypeInformation -InputObject $ADRObj).Save($ADFileName)
+        Invoke-AADRAtomicFileWrite -Path $ADFileName -Writer {
+            param($targetFile)
+            (ConvertTo-Xml -NoTypeInformation -InputObject $ADRObj -Depth 20 -ErrorAction Stop).Save($targetFile)
+        }
     }
     Catch
     {
-        Write-Warning "[Export-ADRXML] Failed to export $($ADFileName)."
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        If (Test-AADRControlFlowError $_) { throw }
+        Add-AADREvent -Operation 'Export-ADRXML' -Status ExportFailed -Detail 'Output file could not be written.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning "[Export-ADRXML] Failed to export $($ADFileName)." -WarningAction Continue
+
     }
 }
 
@@ -1130,12 +1838,17 @@ Function Export-ADRJSON
 
     Try
     {
-        ConvertTo-JSON -InputObject $ADRObj | Out-File -FilePath $ADFileName
+        Invoke-AADRAtomicFileWrite -Path $ADFileName -Writer {
+            param($targetFile)
+            ConvertTo-JSON -InputObject $ADRObj -Depth 20 -WarningAction Stop -ErrorAction Stop | Out-File -LiteralPath $targetFile -Encoding UTF8 -ErrorAction Stop
+        }
     }
     Catch
     {
-        Write-Warning "[Export-ADRJSON] Failed to export $($ADFileName)."
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        If (Test-AADRControlFlowError $_) { throw }
+        Add-AADREvent -Operation 'Export-ADRJSON' -Status ExportFailed -Detail 'Output file could not be written.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning "[Export-ADRJSON] Failed to export $($ADFileName)." -WarningAction Continue
+
     }
 }
 
@@ -1203,32 +1916,36 @@ table {
 "@
     Try
     {
-        If ($ADFileName.Contains("Index"))
-        {
-            $HTMLPath  = -join($AADROutputDir,'\','HTML-Files')
-            $HTMLPath = $((Convert-Path $HTMLPath).TrimEnd("\"))
-            $HTMLFiles = Get-ChildItem -Path $HTMLPath -name
-            $HTML = $HTMLFiles | ConvertTo-HTML -Title "AzureADRecon" -Property @{Label="Table of Contents";Expression={"<a href='$($_)'>$($_)</a>"}} -Head $Header
-
-            Add-Type -AssemblyName System.Web
-            [System.Web.HttpUtility]::HtmlDecode($HTML) | Out-File -FilePath $ADFileName
-        }
-        Else
-        {
-            If ($ADRObj -is [array])
+        Invoke-AADRAtomicFileWrite -Path $ADFileName -Writer {
+            param($targetFile)
+            If ([System.IO.Path]::GetFileName($ADFileName) -ieq 'Index.html')
             {
-                $ADRObj | Select-Object * | ConvertTo-HTML -As Table -Head $Header | Out-File -FilePath $ADFileName
+                $HTMLPath  = (Join-AADRPath @($AADROutputDir, 'HTML-Files'))
+                $HTMLPath = (Resolve-Path -LiteralPath $HTMLPath -ErrorAction Stop).Path
+                $HTMLFiles = Get-ChildItem -LiteralPath $HTMLPath -Name -ErrorAction Stop
+                $HTML = $HTMLFiles | ConvertTo-HTML -Title "AzureADRecon" -Property @{Label="Table of Contents";Expression={"<a href='$($_)'>$($_)</a>"}} -Head $Header
+
+                [System.Net.WebUtility]::HtmlDecode($HTML) | Out-File -LiteralPath $targetFile -Encoding UTF8 -ErrorAction Stop
             }
             Else
             {
-                ConvertTo-HTML -InputObject $ADRObj -As Table -Head $Header | Out-File -FilePath $ADFileName
+                If ($ADRObj -is [array])
+                {
+                    $ADRObj | Select-Object * | ConvertTo-HTML -As Table -Head $Header | Out-File -LiteralPath $targetFile -Encoding UTF8 -ErrorAction Stop
+                }
+                Else
+                {
+                    ConvertTo-HTML -InputObject $ADRObj -As Table -Head $Header | Out-File -LiteralPath $targetFile -Encoding UTF8 -ErrorAction Stop
+                }
             }
         }
     }
     Catch
     {
-        Write-Warning "[Export-ADRHTML] Failed to export $($ADFileName)."
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        If (Test-AADRControlFlowError $_) { throw }
+        Add-AADREvent -Operation 'Export-ADRHTML' -Status ExportFailed -Detail 'Output file could not be written.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning "[Export-ADRHTML] Failed to export $($ADFileName)." -WarningAction Continue
+
     }
 }
 
@@ -1294,22 +2011,22 @@ Function Export-ADR
         }
         'CSV'
         {
-            $ADFileName  = -join($AADROutputDir,'\','CSV-Files','\',$ADRModuleName,'.csv')
+            $ADFileName  = (Join-AADRPath @($AADROutputDir, 'CSV-Files', ($ADRModuleName + '.csv')))
             Export-ADRCSV -ADRObj $ADRObj -ADFileName $ADFileName
         }
         'XML'
         {
-            $ADFileName  = -join($AADROutputDir,'\','XML-Files','\',$ADRModuleName,'.xml')
+            $ADFileName  = (Join-AADRPath @($AADROutputDir, 'XML-Files', ($ADRModuleName + '.xml')))
             Export-ADRXML -ADRObj $ADRObj -ADFileName $ADFileName
         }
         'JSON'
         {
-            $ADFileName  = -join($AADROutputDir,'\','JSON-Files','\',$ADRModuleName,'.json')
+            $ADFileName  = (Join-AADRPath @($AADROutputDir, 'JSON-Files', ($ADRModuleName + '.json')))
             Export-ADRJSON -ADRObj $ADRObj -ADFileName $ADFileName
         }
         'HTML'
         {
-            $ADFileName  = -join($AADROutputDir,'\','HTML-Files','\',$ADRModuleName,'.html')
+            $ADFileName  = (Join-AADRPath @($AADROutputDir, 'HTML-Files', ($ADRModuleName + '.html')))
             Export-ADRHTML -ADRObj $ADRObj -ADFileName $ADFileName -AADROutputDir $AADROutputDir
         }
     }
@@ -1339,7 +2056,7 @@ Function Get-ADRExcelComObj
         If ($SaveVerbosePreference)
         {
             $script:VerbosePreference = $SaveVerbosePreference
-            Remove-Variable SaveVerbosePreference
+            Remove-Variable SaveVerbosePreference -ErrorAction SilentlyContinue
         }
     }
     Catch
@@ -1347,10 +2064,10 @@ Function Get-ADRExcelComObj
         If ($SaveVerbosePreference)
         {
             $script:VerbosePreference = $SaveVerbosePreference
-            Remove-Variable SaveVerbosePreference
+            Remove-Variable SaveVerbosePreference -ErrorAction SilentlyContinue
         }
         Write-Warning "[Get-ADRExcelComObj] Excel does not appear to be installed. Skipping generation of AzureADRecon-Report.xlsx. Use the -GenExcel parameter to generate the AzureADRecon-Report.xslx on a host with Microsoft Excel installed."
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        Write-Verbose "[EXCEPTION] operation unavailable"
         Return $null
     }
     $excel.Visible = $true
@@ -1380,6 +2097,7 @@ Function Get-ADRExcelComObjRelease
 #>
     param(
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         $ComObjtoRelease,
 
         [Parameter(Mandatory = $false)]
@@ -1387,16 +2105,19 @@ Function Get-ADRExcelComObjRelease
     )
     # https://msdn.microsoft.com/en-us/library/system.runtime.interopservices.marshal.releasecomobject(v=vs.110).aspx
     # https://msdn.microsoft.com/en-us/library/system.runtime.interopservices.marshal.finalreleasecomobject(v=vs.110).aspx
-    If ($Final)
+    If ($null -eq $ComObjtoRelease -or -Not [System.Runtime.InteropServices.Marshal]::IsComObject($ComObjtoRelease)) { return }
+    Try
     {
-        [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ComObjtoRelease) | Out-Null
+        If ($Final) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ComObjtoRelease) | Out-Null }
+        Else { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObjtoRelease) | Out-Null }
     }
-    Else
+    Catch
     {
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObjtoRelease) | Out-Null
+        If (Test-AADRControlFlowError $_) { throw }
+        $script:AADRExcelFailed = $true
+        Add-AADREvent -Operation 'Excel cleanup' -Status CleanupFailed -Detail 'A COM reference could not be released.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning '[Excel cleanup] A COM reference could not be released.' -WarningAction Continue
     }
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
 }
 
 Function Get-ADRExcelWorkbook
@@ -1422,7 +2143,7 @@ Function Get-ADRExcelWorkbook
     $worksheet.Name = $name
 
     Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-    Remove-Variable worksheet
+    Remove-Variable worksheet -ErrorAction SilentlyContinue
 }
 
 Function Get-ADRExcelImport
@@ -1483,15 +2204,15 @@ Function Get-ADRExcelImport
             $worksheet.QueryTables.item($Connector.name).delete()
 
             Get-ADRExcelComObjRelease -ComObjtoRelease $CellRef
-            Remove-Variable CellRef
+            Remove-Variable CellRef -ErrorAction SilentlyContinue
             Get-ADRExcelComObjRelease -ComObjtoRelease $Connector
-            Remove-Variable Connector
+            Remove-Variable Connector -ErrorAction SilentlyContinue
 
             $listObject = $worksheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange, $worksheet.UsedRange, $null, [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes, $null)
             $listObject.TableStyle = "TableStyleLight2" # Style Cheat Sheet: https://msdn.microsoft.com/en-au/library/documentformat.openxml.spreadsheet.tablestyle.aspx
             $worksheet.UsedRange.EntireColumn.AutoFit() | Out-Null
         }
-        Remove-Variable ADFileName
+        Remove-Variable ADFileName -ErrorAction SilentlyContinue
     }
     Elseif ($Method -eq 2)
     {
@@ -1507,7 +2228,7 @@ Function Get-ADRExcelImport
                     $row++
                 }
             }
-            Remove-Variable ADTemp
+            Remove-Variable ADTemp -ErrorAction SilentlyContinue
             $listObject = $worksheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange, $worksheet.UsedRange, $null, [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes, $null)
             $listObject.TableStyle = "TableStyleLight2" # Style Cheat Sheet: https://msdn.microsoft.com/en-au/library/documentformat.openxml.spreadsheet.tablestyle.aspx
             $usedRange = $worksheet.UsedRange
@@ -1517,12 +2238,12 @@ Function Get-ADRExcelImport
         {
             $worksheet.Cells.Item($row, $column) = "Error!"
         }
-        Remove-Variable ADFileName
+        Remove-Variable ADFileName -ErrorAction SilentlyContinue
     }
     $excel.ScreenUpdating = $true
 
     Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-    Remove-Variable worksheet
+    Remove-Variable worksheet -ErrorAction SilentlyContinue
 }
 
 # Thanks Anant Shrivastava for the suggestion of using Pivot Tables for generation of the Stats sheets.
@@ -1615,22 +2336,22 @@ Function Get-ADRExcelPivotTable
     {
         $PivotFailed = $true
         Write-Verbose "[PivotCaches().Create] Failed"
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        Write-Verbose "[EXCEPTION] operation unavailable"
     }
     If ( $PivotFailed -eq $true )
     {
         $rows = $SrcWorksheet.UsedRange.Rows.Count
-        ElseIf ($SrcSheetName -eq "Users")
+        If ($SrcSheetName -eq "Users")
         {
             $PivotCols = "A1:C"
         }
         $UsedRange = $SrcWorksheet.Range($PivotCols+$rows)
         $PivotCaches = $workbook.PivotCaches().Create([Microsoft.Office.Interop.Excel.XlPivotTableSourceType]::xlDatabase, $UsedRange, [Microsoft.Office.Interop.Excel.XlPivotTableVersionList]::xlPivotTableVersion12)
-        Remove-Variable rows
-	    Remove-Variable PivotCols
-        Remove-Variable UsedRange
+        Remove-Variable rows -ErrorAction SilentlyContinue
+	    Remove-Variable PivotCols -ErrorAction SilentlyContinue
+        Remove-Variable UsedRange -ErrorAction SilentlyContinue
     }
-    Remove-Variable PivotFailed
+    Remove-Variable PivotFailed -ErrorAction SilentlyContinue
     $PivotTable = $PivotCaches.CreatePivotTable($PivotLocation,$PivotTableName)
     # $workbook.ShowPivotTableFieldList = $true
 
@@ -1685,13 +2406,13 @@ Function Get-ADRExcelPivotTable
     $excel.ScreenUpdating = $true
 
     Get-ADRExcelComObjRelease -ComObjtoRelease $PivotField
-    Remove-Variable PivotField
+    Remove-Variable PivotField -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $PivotTable
-    Remove-Variable PivotTable
+    Remove-Variable PivotTable -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $PivotCaches
-    Remove-Variable PivotCaches
+    Remove-Variable PivotCaches -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $SrcWorksheet
-    Remove-Variable SrcWorksheet
+    Remove-Variable SrcWorksheet -ErrorAction SilentlyContinue
 }
 
 Function Get-ADRExcelAttributeStats
@@ -1773,7 +2494,7 @@ Function Get-ADRExcelAttributeStats
     $MergeCells = $worksheet.Range("A1:C1")
     $MergeCells.Select() | Out-Null
     $MergeCells.MergeCells = $true
-    Remove-Variable MergeCells
+    Remove-Variable MergeCells -ErrorAction SilentlyContinue
 
     Get-ADRExcelPivotTable -SrcSheetName $SrcSheetName -PivotTableName $PivotTableName -PivotRows @($PivotRows) -PivotValues @($PivotValues) -PivotPercentage @($PivotPercentage) -PivotLocation "R2C1"
     $excel.ScreenUpdating = $false
@@ -1794,6 +2515,7 @@ Function Get-ADRExcelAttributeStats
         {
             "TRUE" { $worksheet.Cells.Item($row, $column) = "Enabled" }
             "FALSE" { $worksheet.Cells.Item($row, $column) = "Disabled" }
+            "(BLANK)" { $worksheet.Cells.Item($row, $column) = "Unknown" }
             "GRAND TOTAL" { $worksheet.Cells.Item($row, $column) = "Total" }
         }
     }
@@ -1808,7 +2530,7 @@ Function Get-ADRExcelAttributeStats
         $MergeCells = $worksheet.Range("F1:L1")
         $MergeCells.Select() | Out-Null
         $MergeCells.MergeCells = $true
-        Remove-Variable MergeCells
+        Remove-Variable MergeCells -ErrorAction SilentlyContinue
 
         $row++
         "Category","Enabled Count","Enabled Percentage","Disabled Count","Disabled Percentage","Total Count","Total Percentage" | ForEach-Object {
@@ -1817,12 +2539,23 @@ Function Get-ADRExcelAttributeStats
             $column++
         }
         $ExcelColumn = ($SrcWorksheet.Columns.Find("Enabled"))
+        If (-Not $ExcelColumn)
+        {
+            Write-Warning '[Get-ADRExcelAttributeStats] Enabled column is unavailable; account-state statistics were skipped.'
+            return
+        }
         $EnabledColAddress = "$($ExcelColumn.Address($false,$false).Substring(0,$ExcelColumn.Address($false,$false).Length-1)):$($ExcelColumn.Address($false,$false).Substring(0,$ExcelColumn.Address($false,$false).Length-1))"
         $column = 6
         $i = 2
 
         $ObjAttributes.keys | ForEach-Object {
-            $ExcelColumn = ($SrcWorksheet.Columns.Find($_))
+            $attribute = If ($_ -eq 'MFAUnknown') { 'MFAStatus' } Else { $_ }
+            $ExcelColumn = ($SrcWorksheet.Columns.Find($attribute))
+            If (-Not $ExcelColumn)
+            {
+                Write-Warning "[Get-ADRExcelAttributeStats] Column $attribute is unavailable; its statistics were skipped."
+                return
+            }
             $ColAddress = "$($ExcelColumn.Address($false,$false).Substring(0,$ExcelColumn.Address($false,$false).Length-1)):$($ExcelColumn.Address($false,$false).Substring(0,$ExcelColumn.Address($false,$false).Length-1))"
             $row++
             $i++
@@ -1832,15 +2565,19 @@ Function Get-ADRExcelAttributeStats
             }
             ElseIf ($_ -eq "MFAStat")
             {
-                $worksheet.Cells.Item($row, $column) = "MFA (Disabled)"
+                $worksheet.Cells.Item($row, $column) = "MFA (Not registered)"
             }
             ElseIf ($_ -eq "MFAStatu")
             {
-                $worksheet.Cells.Item($row, $column) = "MFA (Weak)"
+                $worksheet.Cells.Item($row, $column) = "MFA (Registered)"
             }
-            ElseIf ($_ -eq "MFAStatus")
+            ElseIf ($_ -eq "MFAUnknown")
             {
-                $worksheet.Cells.Item($row, $column) = "MFA (Strong)"
+                $worksheet.Cells.Item($row, $column) = 'MFA (Unknown)'
+            }
+            ElseIf ($_ -eq "MFA Capable")
+            {
+                $worksheet.Cells.Item($row, $column) = "MFA (Capable)"
             }
             Else
             {
@@ -1856,7 +2593,6 @@ Function Get-ADRExcelAttributeStats
             {
                 $worksheet.Cells.Item($row, $column+1).Formula = "=COUNTIFS('" + $SrcWorksheet.Name + "'!" + $EnabledColAddress + ',"TRUE",' + "'" + $SrcWorksheet.Name + "'!" + $ColAddress + ',' + $ObjAttributes[$_] + ')'
             }
-            $worksheet.Cells.Item($row, $column+2).Formula = '=IFERROR(G' + $i + '/VLOOKUP("Enabled",A3:B5,2,FALSE),0)'
             If ($_ -eq "PasswordPolicies")
             {
                 # Remove count of "None"
@@ -1866,7 +2602,6 @@ Function Get-ADRExcelAttributeStats
             {
                 $worksheet.Cells.Item($row, $column+3).Formula = "=COUNTIFS('" + $SrcWorksheet.Name + "'!" + $EnabledColAddress + ',"FALSE",' + "'" + $SrcWorksheet.Name + "'!" + $ColAddress + ',' + $ObjAttributes[$_] + ')'
             }
-            $worksheet.Cells.Item($row, $column+4).Formula = '=IFERROR(I' + $i + '/VLOOKUP("Disabled",A3:B5,2,FALSE),0)'
             If ($_ -eq "AssignedLicenses")
             {
                 # Remove count of FieldName
@@ -1881,7 +2616,21 @@ Function Get-ADRExcelAttributeStats
             {
                 $worksheet.Cells.Item($row, $column+5).Formula = "=COUNTIF('" + $SrcWorksheet.Name + "'!" + $ColAddress + ',' + $ObjAttributes[$_] + ')'
             }
-            $worksheet.Cells.Item($row, $column+6).Formula = '=IFERROR(K' + $i + '/VLOOKUP("Total",A3:B5,2,FALSE),0)'
+            # Show blank counts where no relevant field values were collected.
+            $fieldRange = "'" + $SrcWorksheet.Name + "'!" + $ColAddress
+            $enabledRange = "'" + $SrcWorksheet.Name + "'!" + $EnabledColAddress
+            ForEach ($offset in @(1, 3, 5))
+            {
+                $formula = [string]$worksheet.Cells.Item($row, $column+$offset).Formula
+                $unavailable = If ($offset -eq 1) { 'COUNTIFS(' + $enabledRange + ',"TRUE",' + $fieldRange + ',"<>")=0' }
+                    ElseIf ($offset -eq 3) { 'COUNTIFS(' + $enabledRange + ',"FALSE",' + $fieldRange + ',"<>")=0' }
+                    Else { 'COUNTIF(' + $fieldRange + ',"<>")<=1' }
+                $worksheet.Cells.Item($row, $column+$offset).Formula = '=IF(' + $unavailable + ',"",' + $formula.TrimStart('=') + ')'
+            }
+            $worksheet.Cells.Item($row, $column+2).Formula = '=IF(G' + $i + '="","",IFERROR(G' + $i + '/COUNTIFS(' + $enabledRange + ',"TRUE",' + $fieldRange + ',"<>"),""))'
+            $worksheet.Cells.Item($row, $column+4).Formula = '=IF(I' + $i + '="","",IFERROR(I' + $i + '/COUNTIFS(' + $enabledRange + ',"FALSE",' + $fieldRange + ',"<>"),""))'
+            $worksheet.Cells.Item($row, $column+6).Formula = '=IF(K' + $i + '="","",IFERROR(K' + $i + '/(COUNTIF(' + $fieldRange + ',"<>")-1),""))'
+
         }
 
         # http://www.excelhowto.com/macros/formatting-a-range-of-cells-in-excel-vba/
@@ -1893,9 +2642,9 @@ Function Get-ADRExcelAttributeStats
     $excel.ScreenUpdating = $true
 
     Get-ADRExcelComObjRelease -ComObjtoRelease $SrcWorksheet
-    Remove-Variable SrcWorksheet
+    Remove-Variable SrcWorksheet -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-    Remove-Variable worksheet
+    Remove-Variable worksheet -ErrorAction SilentlyContinue
 }
 
 Function Get-ADRExcelChart
@@ -1986,11 +2735,11 @@ Function Get-ADRExcelChart
         $ChartData = $worksheet.Range($X,$Y)
 
         Get-ADRExcelComObjRelease -ComObjtoRelease $X
-        Remove-Variable X
+        Remove-Variable X -ErrorAction SilentlyContinue
         Get-ADRExcelComObjRelease -ComObjtoRelease $Y
-        Remove-Variable Y
+        Remove-Variable Y -ErrorAction SilentlyContinue
         Get-ADRExcelComObjRelease -ComObjtoRelease $start
-        Remove-Variable start
+        Remove-Variable start -ErrorAction SilentlyContinue
     }
     $chart.SetSourceData($ChartData)
     # https://docs.microsoft.com/en-us/dotnet/api/microsoft.office.interop.excel.chartclass.plotby?redirectedfrom=MSDN&view=excel-pia#Microsoft_Office_Interop_Excel_ChartClass_PlotBy
@@ -2011,13 +2760,13 @@ Function Get-ADRExcelChart
     $excel.DisplayAlerts = $true
 
     Get-ADRExcelComObjRelease -ComObjtoRelease $chart
-    Remove-Variable chart
+    Remove-Variable chart -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $ChartData
-    Remove-Variable ChartData
+    Remove-Variable ChartData -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $temp
-    Remove-Variable temp
+    Remove-Variable temp -ErrorAction SilentlyContinue
     Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-    Remove-Variable worksheet
+    Remove-Variable worksheet -ErrorAction SilentlyContinue
 }
 
 Function Get-ADRExcelSort
@@ -2075,10 +2824,54 @@ Function Get-ADRExcelSort
         Write-Verbose "[Get-ADRExcelSort] $($ColumnName) not found in the $($worksheet.Name) worksheet."
     }
     Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-    Remove-Variable worksheet
+    Remove-Variable worksheet -ErrorAction SilentlyContinue
 }
 
 Function Export-ADRExcel
+{
+    [CmdletBinding()]
+    param([string] $ExcelPath, [string] $Logo = 'AzureADRecon')
+    $script:AADRExcelFailed = $false
+    If ($env:OS -ne 'Windows_NT')
+    {
+        $script:AADRExcelFailed = $true
+        Add-AADREvent -Operation Excel -Status ExportFailed -Detail 'Desktop Excel requires Windows.'
+        Write-Warning 'Desktop Excel generation requires Windows. CSV reports remain available.'
+        return
+    }
+    $ErrorActionPreference = 'Stop'
+    $global:excel = $null
+    $global:workbook = $null
+    Try
+    {
+        $warnings = @()
+        Export-AADRExcelCore -ExcelPath $ExcelPath -Logo $Logo -WarningVariable +warnings
+        If ($warnings.Count -gt 0) { $script:AADRExcelFailed=$true; Add-AADREvent -Operation Excel -Status ExportFailed -Detail 'Excel generation emitted a warning; verify the workbook before use.' }
+    }
+    Catch
+    {
+        If (Test-AADRControlFlowError $_) { throw }
+        $script:AADRExcelFailed = $true
+        Add-AADREvent -Operation Excel -Status ExportFailed -Detail 'Desktop Excel generation failed.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+        Write-Warning '[Export-ADRExcel] Workbook generation failed. CSV reports remain available; check Excel installation and workbook access.' -WarningAction Continue
+    }
+    Finally
+    {
+        If ($global:excel)
+        {
+            Try { $global:excel.Quit() }
+            Catch { $script:AADRExcelFailed=$true; Add-AADREvent -Operation 'Excel cleanup' -Status CleanupFailed -Detail 'Excel could not be closed cleanly.' -Diagnostic (Get-AADRErrorDiagnostic $_) }
+        }
+        ForEach ($name in @('workbook','excel'))
+        {
+            $object = Get-Variable -Name $name -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            Get-ADRExcelComObjRelease -ComObjtoRelease $object -Final $true
+            Remove-Variable -Name $name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Function Export-AADRExcelCore
 {
 <#
 .SYNOPSIS
@@ -2108,28 +2901,31 @@ Function Export-ADRExcel
 
     If ($PSVersionTable.PSEdition -eq "Core")
     {
-        If ($PSVersionTable.Platform -eq "Win32NT")
+        If ($env:OS -eq "Windows_NT")
         {
             $returndir = Get-Location
-            Set-Location C:\Windows\assembly\
-            $refFolder = (Get-ChildItem -Recurse  Microsoft.Office.Interop.Excel.dll).Directory
-            If ($refFolder)
+            Try
             {
-                Set-Location $refFolder
-                Add-Type -AssemblyName "Microsoft.Office.Interop.Excel"
+                Set-Location 'C:\Windows\assembly\' -ErrorAction Stop
+                $refFolder = Get-ChildItem -Recurse -Filter Microsoft.Office.Interop.Excel.dll -ErrorAction Stop | Select-Object -First 1 -ExpandProperty DirectoryName
+                If ($refFolder)
+                {
+                    Set-Location -LiteralPath $refFolder -ErrorAction Stop
+                    Add-Type -AssemblyName "Microsoft.Office.Interop.Excel" -ErrorAction Stop
+                }
             }
-            Set-Location $returndir
-            Remove-Variable returndir
-            Remove-Variable refFolder
+            Finally { Set-Location -LiteralPath $returndir -ErrorAction SilentlyContinue }
+            Remove-Variable returndir -ErrorAction SilentlyContinue
+            Remove-Variable refFolder -ErrorAction SilentlyContinue
         }
     }
 
-    $ExcelPath = $((Convert-Path $ExcelPath).TrimEnd("\"))
-    $ReportPath = -join($ExcelPath,'\','CSV-Files')
+    $ExcelPath = (Resolve-Path -LiteralPath $ExcelPath).Path
+    $ReportPath = (Join-AADRPath @($ExcelPath, 'CSV-Files'))
     If (!(Test-Path $ReportPath))
     {
         Write-Warning "[Export-ADRExcel] Could not locate the CSV-Files directory ... Exiting"
-        Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
+        Write-Verbose "[EXCEPTION] operation unavailable"
         Return $null
     }
     Get-ADRExcelComObj
@@ -2137,114 +2933,114 @@ Function Export-ADRExcel
     {
         Write-Output "[*] Generating AzureADRecon-Report.xlsx"
 
-        $ADFileName = -join($ReportPath,'\','AboutAzureADRecon.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'AboutAzureADRecon.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelImport -ADFileName $ADFileName
 
-            $Method = (Import-CSV -Path $ADFileName)[2].Category
+            $Method = ((Import-CSV -Path $ADFileName) | Where-Object Category -eq 'MSGraph' | Select-Object -First 1).Category
 
             $workbook.Worksheets.Item(1).Name = "About AzureADRecon"
             $workbook.Worksheets.Item(1).Hyperlinks.Add($workbook.Worksheets.Item(1).Cells.Item(3,2) , "https://github.com/adrecon/AzureADRecon", "" , "", "github.com/adrecon/AzureADRecon") | Out-Null
             $workbook.Worksheets.Item(1).UsedRange.EntireColumn.AutoFit() | Out-Null
 
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','Tenant.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Tenant.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Tenant"
             Get-ADRExcelImport -ADFileName $ADFileName
             $TenantObj = Import-CSV -Path $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
             $TenantName = -join($TenantObj[0].Value,"-")
-            Remove-Variable TenantObj
+            Remove-Variable TenantObj -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','Domain.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Domain.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Domain"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join ($ReportPath, '\', 'ConditionalAccessPolicies.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'ConditionalAccessPolicies.csv'))
         If (Test-Path $ADFileName) {
             Get-ADRExcelWorkbook -Name "ConditionalAccessPolicies"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','Licenses.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Licenses.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Licenses"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','Devices.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Devices.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Devices"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','GroupMembers.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'GroupMembers.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "GroupMembers"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
 
             Get-ADRExcelSort -ColumnName "GroupName"
         }
 
-        $ADFileName = -join($ReportPath,'\','Groups.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Groups.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Groups"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
 
             Get-ADRExcelSort -ColumnName "DisplayName"
         }
 
-        $ADFileName = -join($ReportPath,'\','DirectoryRoleMembers.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'DirectoryRoleMembers.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "DirectoryRoleMembers"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
 
             Get-ADRExcelSort -ColumnName "DirectoryRole"
         }
 
-        $ADFileName = -join($ReportPath,'\','DirectoryRoles.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'DirectoryRoles.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "DirectoryRoles"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','ServicePrincipals.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'ServicePrincipals.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "ServicePrincipals"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
         }
 
-        $ADFileName = -join($ReportPath,'\','Users.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Users.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "Users"
             Get-ADRExcelImport -ADFileName $ADFileName
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
 
             Get-ADRExcelSort -ColumnName "UserPrincipalName"
 
@@ -2263,15 +3059,15 @@ Function Export-ADRExcel
             $excel.Selection.AutoFilter(3,$true) | Out-Null
             $worksheet.Cells.Item(1,1).Select() | Out-Null
             Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet
-            Remove-Variable worksheet
+            Remove-Variable worksheet -ErrorAction SilentlyContinue
         }
 
         # User Stats
-        $ADFileName = -join($ReportPath,'\','Users.csv')
+        $ADFileName = (Join-AADRPath @($ReportPath, 'Users.csv'))
         If (Test-Path $ADFileName)
         {
             Get-ADRExcelWorkbook -Name "User Stats"
-            Remove-Variable ADFileName
+            Remove-Variable ADFileName -ErrorAction SilentlyContinue
 
             $ObjAttributes = New-Object System.Collections.Specialized.OrderedDictionary
             $ObjAttributes.Add("UserType", '"Guest"')
@@ -2281,17 +3077,20 @@ Function Export-ADRExcel
                 $ObjAttributes.Add("Password Age (>", '"TRUE"')
                 $ObjAttributes.Add("Never Logged In", '"TRUE"')
                 $ObjAttributes.Add("Dormant (>", '"TRUE"')
-                $ObjAttributes.Add("MFAStat", '"Disabled"')
-                $ObjAttributes.Add("MFAStatu", '"Weak"')
-                $ObjAttributes.Add("MFAStatus", '"Strong"')
+                $ObjAttributes.Add("MFAStat", '"NotRegistered"')
+                $ObjAttributes.Add("MFAStatu", '"Registered"')
+                $ObjAttributes.Add("MFA Capable", '"TRUE"')
+                $ObjAttributes.Add("MFAUnknown", '"Unknown"')
             }
 
             Get-ADRExcelAttributeStats -SrcSheetName "Users" -Title1 "User Accounts in AzureAD" -PivotTableName "User Accounts Status" -PivotRows "Enabled" -PivotValues "UserPrincipalName" -PivotPercentage "UserPrincipalName"  -Title2 "Status of User Accounts in AzureAD" -ObjAttributes $ObjAttributes
 
-            Get-ADRExcelChart -ChartType "xlPie" -ChartLayout 3 -ChartTitle "User Accounts in AzureAD" -RangetoCover "A12:D24" -ChartData $workbook.Worksheets.Item(1).Range("A3:A4,B3:B4")
+            $totalCell = $workbook.Worksheets.Item(1).Columns.Item(1).Find('Total')
+            $summaryEndRow = If ($totalCell) { [Math]::Max(3, $totalCell.Row - 1) } Else { 4 }
+            Get-ADRExcelChart -ChartType "xlPie" -ChartLayout 3 -ChartTitle "User Accounts in AzureAD" -RangetoCover "A12:D24" -ChartData $workbook.Worksheets.Item(1).Range("A3:A$summaryEndRow,B3:B$summaryEndRow")
             $workbook.Worksheets.Item(1).Hyperlinks.Add($workbook.Worksheets.Item(1).Cells.Item(11,1) , "" , "Users!A1", "", "Raw Data") | Out-Null
 
-            Get-ADRExcelChart -ChartType "xlBarClustered" -ChartLayout 1 -ChartTitle "Status of User Accounts in AzureAD" -RangetoCover "F12:L24" -ChartData $workbook.Worksheets.Item(1).Range("F2:F9,G2:G9")
+            Get-ADRExcelChart -ChartType "xlBarClustered" -ChartLayout 1 -ChartTitle "Status of User Accounts in AzureAD" -RangetoCover "F12:L24" -ChartData $workbook.Worksheets.Item(1).Range("F2:F10,G2:G10")
             $workbook.Worksheets.Item(1).Hyperlinks.Add($workbook.Worksheets.Item(1).Cells.Item(11,6) , "" , "Users!A1", "", "Raw Data") | Out-Null
 
             $workbook.Worksheets.Item(1).UsedRange.EntireColumn.AutoFit() | Out-Null
@@ -2317,18 +3116,18 @@ Function Export-ADRExcel
         }
 
         $bytes = [System.Convert]::FromBase64String($base64aadrecon)
-        Remove-Variable base64aadrecon
+        Remove-Variable base64aadrecon -ErrorAction SilentlyContinue
 
-        $CompanyLogo = -join($ReportPath,'\','AzureADRecon_Logo.jpg')
+        $CompanyLogo = (Join-AADRPath @($ReportPath, 'AzureADRecon_Logo.jpg'))
 		$p = New-Object IO.MemoryStream($bytes, 0, $bytes.length)
 		$p.Write($bytes, 0, $bytes.length)
         Add-Type -AssemblyName System.Drawing
 		$picture = [System.Drawing.Image]::FromStream($p, $true)
 		$picture.Save($CompanyLogo)
 
-        Remove-Variable bytes
-        Remove-Variable p
-        Remove-Variable picture
+        Remove-Variable bytes -ErrorAction SilentlyContinue
+        Remove-Variable p -ErrorAction SilentlyContinue
+        Remove-Variable picture -ErrorAction SilentlyContinue
 
         $LinkToFile = $false
         $SaveWithDocument = $true
@@ -2340,18 +3139,18 @@ Function Export-ADRExcel
         # Add image to the Sheet
         $worksheet.Shapes.AddPicture($CompanyLogo, $LinkToFile, $SaveWithDocument, $Left, $Top, $Width, $Height) | Out-Null
 
-        Remove-Variable LinkToFile
-        Remove-Variable SaveWithDocument
-        Remove-Variable Left
-        Remove-Variable Top
-        Remove-Variable Width
-        Remove-Variable Height
+        Remove-Variable LinkToFile -ErrorAction SilentlyContinue
+        Remove-Variable SaveWithDocument -ErrorAction SilentlyContinue
+        Remove-Variable Left -ErrorAction SilentlyContinue
+        Remove-Variable Top -ErrorAction SilentlyContinue
+        Remove-Variable Width -ErrorAction SilentlyContinue
+        Remove-Variable Height -ErrorAction SilentlyContinue
 
         If (Test-Path -Path $CompanyLogo)
         {
             Remove-Item $CompanyLogo
         }
-        Remove-Variable CompanyLogo
+        Remove-Variable CompanyLogo -ErrorAction SilentlyContinue
 
         $row = 5
         $column = 1
@@ -2372,7 +3171,7 @@ Function Export-ADRExcel
 
         $excel.Windows.Item(1).Displaygridlines = $false
         $excel.ScreenUpdating = $true
-        $ADStatFileName = -join($ExcelPath,'\',$TenantName,'AzureADRecon-Report.xlsx')
+        $ADStatFileName = Join-Path $ExcelPath 'AzureADRecon-Report.xlsx'
         Try
         {
             # Disable prompt if file exists
@@ -2382,16 +3181,69 @@ Function Export-ADRExcel
         }
         Catch
         {
-            Write-Error "[EXCEPTION] $($_.Exception.Message)"
+            throw [System.IO.IOException]::new('Excel workbook could not be saved. Check workbook access and disk space.')
         }
         $excel.Quit()
         Get-ADRExcelComObjRelease -ComObjtoRelease $worksheet -Final $true
-        Remove-Variable worksheet
+        Remove-Variable worksheet -ErrorAction SilentlyContinue
         Get-ADRExcelComObjRelease -ComObjtoRelease $workbook -Final $true
-        Remove-Variable -Name workbook -Scope Global
+        Remove-Variable -Name workbook -Scope Global -ErrorAction SilentlyContinue
         Get-ADRExcelComObjRelease -ComObjtoRelease $excel -Final $true
-        Remove-Variable -Name excel -Scope Global
-        Remove-Variable Method
+        Remove-Variable -Name excel -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable Method -ErrorAction SilentlyContinue
+    }
+}
+
+Function Test-AADRGraphNotFoundError
+{
+    param([Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $Record)
+    $details = @($Record.FullyQualifiedErrorId, $Record.Exception.Message, $Record.ErrorDetails.Message) -join ' '
+    If ($details -match 'Request_ResourceNotFound|ResourceNotFound|ErrorItemNotFound') { return $true }
+    ForEach ($status in @($Record.Exception.ResponseStatusCode, $Record.Exception.StatusCode, $Record.Exception.Response.StatusCode))
+    {
+        If ([string]$status -in @('404', 'NotFound')) { return $true }
+    }
+    return $false
+}
+
+Function Invoke-AADRGraphCollection
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [string] $Name,
+          [Parameter(Mandatory = $true)] [scriptblock] $Query,
+          [hashtable] $State,
+          [switch] $AllowNotFound)
+
+    If ($null -ne $State) { $State.Available = $false; $State.FailureStatus = $null; $State.Diagnostic = $null }
+    Try
+    {
+        $items = @(Invoke-AADRReadRequest -Query $Query)
+        If ($null -ne $State) { $State.Available = $true }
+        $items | Where-Object { $null -ne $_ }
+    }
+    Catch
+    {
+        If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }
+        $diagnostic = Get-AADRErrorDiagnostic $_
+        If ($AllowNotFound -and (Test-AADRGraphNotFoundError -Record $_))
+        {
+            If ($null -ne $State) { $State.FailureStatus='Unavailable'; $State.Diagnostic=$diagnostic }
+            Add-AADREvent -Operation $Name -Status Unavailable -Detail 'Referenced object was not found.'
+            Write-Warning "[$Name] Referenced object was not found. Its known ID is retained and unavailable details remain blank."
+            return
+        }
+        If (Test-AADRGraphPermissionError -Record $_)
+        {
+            If ($null -ne $State) { $State.FailureStatus='PermissionDenied'; $State.Diagnostic=$diagnostic }
+            Add-AADREvent -Operation $Name -Status PermissionDenied -Detail 'Graph denied access to this dataset.' -Diagnostic $diagnostic
+            Write-Warning "[$Name] Graph denied access. This data is unavailable, not an empty result. Check Graph permissions, delegated role, and licensing. Other collections will continue." -WarningAction Continue
+        }
+        Else
+        {
+            If ($null -ne $State) { $State.FailureStatus='Unavailable'; $State.Diagnostic=$diagnostic }
+            Add-AADREvent -Operation $Name -Status Unavailable -Detail 'Dataset request failed. Partial pages were discarded; data remains unknown. Independent requests will continue.' -Diagnostic $diagnostic
+            Write-Warning "[$Name] Dataset unavailable ($($diagnostic.Category)). Independent requests will continue. $($diagnostic.Guidance)" -WarningAction Continue
+        }
     }
 }
 
@@ -2423,15 +3275,16 @@ Function Get-AADRTenant
         [int] $Threads = 10
     )
 
+    $AADRTenantObj = $null
     If ($Method -eq 'MSGraph')
     {
-        $AADRTenant = @( Get-MgOrganization -All )
+        $AADRTenant = @(Invoke-AADRGraphCollection -Name 'Get-AADRTenant' -Query { Get-MgOrganization -All -ErrorAction Stop })
         If ($AADRTenant)
         {
             $AADRTenantObj = @()
             $AADRTenant | ForEach-Object {
 
-                $ObjValues = @("DisplayName", [string] $_.DisplayName, "Creation Date", [datetime] $_.CreatedDateTime)
+                $ObjValues = @("DisplayName", $_.DisplayName, "Creation Date", $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.CreatedDateTime)) { [datetime]$_.CreatedDateTime } Else { $null }))
 
                 For ($i = 0; $i -lt $($ObjValues.Count); $i++)
                 {
@@ -2444,7 +3297,7 @@ Function Get-AADRTenant
 
                 For ($i = 0; $i -lt $_.VerifiedDomains.Count; $i++)
                 {
-                    $ObjValues = @("VerifiedDomain($i) - Name", [string] $_.VerifiedDomains[$i].Name, "VerifiedDomain($i) - Type", $_.VerifiedDomains[$i].Type, "VerifiedDomain($i) - Capabilities", [string] $_.VerifiedDomains[$i].Capabilities, "VerifiedDomain($i) - _Default", [bool] $_.VerifiedDomains[$i].IsDefault, "VerifiedDomain($i) - Initial", [bool] $_.VerifiedDomains[$i].IsInitial)
+                    $ObjValues = @("VerifiedDomain($i) - Name", $_.VerifiedDomains[$i].Name, "VerifiedDomain($i) - Type", $_.VerifiedDomains[$i].Type, "VerifiedDomain($i) - Capabilities", $_.VerifiedDomains[$i].Capabilities, "VerifiedDomain($i) - _Default", $_.VerifiedDomains[$i].IsDefault, "VerifiedDomain($i) - Initial", $_.VerifiedDomains[$i].IsInitial)
 
                     For ($icnt = 0; $icnt -lt $($ObjValues.Count); $icnt++)
                     {
@@ -2456,13 +3309,9 @@ Function Get-AADRTenant
                     }
                 }
 
-                For ($i = 0; $i -lt $_.TechnicalNotificationMails.Count; $i++)
-                {
-                    $TechnicalNotificationMails = $TechnicalNotificationMails + "," + $_.TechnicalNotificationMails[$i];
-                }
-                $TechnicalNotificationMails = $TechnicalNotificationMails.TrimStart(',');
+                $TechnicalNotificationMails = If ($null -ne $_.TechnicalNotificationMails) { $_.TechnicalNotificationMails -join ',' } Else { $null }
 
-                $ObjValues = @("OnPremisesSyncEnabled", [string] $_.OnPremisesSyncEnabled, "OnPremisesLastSyncDateTime", [string] $_.OnPremisesLastSyncDateTime, "Street", [string] $_.Street, "City", [string] $_.City, "PostalCode", [string] $_.PostalCode, "State", [string] $_.State, "Country", [string] $_.Country, "CountryLetterCode", [string] $_.CountryLetterCode, "TelephoneNumber", [string] $_.TelephoneNumber, "TechnicalNotificationMails", $TechnicalNotificationMails)
+                $ObjValues = @("OnPremisesSyncEnabled", $_.OnPremisesSyncEnabled, "OnPremisesLastSyncDateTime", $_.OnPremisesLastSyncDateTime, "Street", $_.Street, "City", $_.City, "PostalCode", $_.PostalCode, "State", $_.State, "Country", $_.Country, "CountryLetterCode", $_.CountryLetterCode, "TelephoneNumber", $_.TelephoneNumber, "TechnicalNotificationMails", $TechnicalNotificationMails)
 
                 For ($i = 0; $i -lt $($ObjValues.Count); $i++)
                 {
@@ -2476,7 +3325,7 @@ Function Get-AADRTenant
                 For ($i = 0; $i -lt $_.AssignedPlans.Count; $i++)
                 {
 
-                    $ObjValues = @("AssignedPlan($i) - AssignedTimestamp", [datetime] $_.AssignedPlans[$i].AssignedDateTime, "AssignedPlan($i) - CapabilityStatus", [string] $_.AssignedPlans[$i].CapabilityStatus, "AssignedPlan($i) - Service", [string] $_.AssignedPlans[$i].Service, "AssignedPlan($i) - ServicePlanId", [bool] $_.AssignedPlans[$i].ServicePlanId)
+                    $ObjValues = @("AssignedPlan($i) - AssignedTimestamp", $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.AssignedPlans[$i].AssignedDateTime)) { [datetime]$_.AssignedPlans[$i].AssignedDateTime } Else { $null }), "AssignedPlan($i) - CapabilityStatus", $_.AssignedPlans[$i].CapabilityStatus, "AssignedPlan($i) - Service", $_.AssignedPlans[$i].Service, "AssignedPlan($i) - ServicePlanId", $_.AssignedPlans[$i].ServicePlanId)
 
                     For ($icnt = 0; $icnt -lt $($ObjValues.Count); $icnt++)
                     {
@@ -2488,7 +3337,7 @@ Function Get-AADRTenant
                     }
                 }
             }
-            Remove-Variable AADRTenant
+            Remove-Variable AADRTenant -ErrorAction SilentlyContinue
         }
     }
 
@@ -2530,13 +3379,14 @@ Function Get-AADRDomain
         [int] $Threads = 10
     )
 
+    $AADRDomainObj = $null
     If ($Method -eq 'MSGraph')
     {
-        $AADRDomain = @( Get-MgDomain )
+        $AADRDomain = @(Invoke-AADRGraphCollection -Name 'Get-AADRDomain' -Query { Get-MgDomain -All -ErrorAction Stop })
         If ($AADRDomain)
         {
-            $AADRDomainObj = [AADRecon.AzureADClass]::DomainParser($AADRDomain, $Threads)
-            Remove-Variable AADRDomain
+            $AADRDomainObj = $script:AADRParserType::DomainParser($AADRDomain, $Threads)
+            Remove-Variable AADRDomain -ErrorAction SilentlyContinue
         }
     }
 
@@ -2578,14 +3428,36 @@ Function Get-AADRLicense
         [int] $Threads = 10
     )
 
-    If ($LicenseObj)
+    $records = @(Invoke-AADRGraphCollection -Name Licenses -Query { Get-AADRGraphPages 'subscribedSkus' })
+    ForEach ($record in $records)
     {
-        Return $LicenseObj
+        [pscustomobject][ordered]@{
+            ObjectId=$record.id; SkuId=$record.skuId; SkuPartNumber=$record.skuPartNumber
+            ConsumedUnits=$record.consumedUnits; CapabilityStatus=$record.capabilityStatus; AppliesTo=$record.appliesTo
+            'PrepaidUnits-Enabled'=$record.prepaidUnits.enabled; 'PrepaidUnits-Suspended'=$record.prepaidUnits.suspended
+            'PrepaidUnits-Warning'=$record.prepaidUnits.warning; 'PrepaidUnits-LockedOut'=$record.prepaidUnits.lockedOut
+            'ServicePlans (Count)'=$(If ($null -ne $record.servicePlans) { @($record.servicePlans).Count } Else { $null })
+            ServicePlans=$(If ($null -ne $record.servicePlans) { ConvertTo-Json -InputObject $record.servicePlans -Depth 10 -Compress } Else { $null })
+        }
     }
-    Else
+}
+
+Function Test-AADRGraphPermissionError
+{
+    param([Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $Record)
+
+    # Graph SDK versions expose service codes through different error surfaces.
+    $details = @($Record.FullyQualifiedErrorId, $Record.Exception.Message, $Record.ErrorDetails.Message) -join ' '
+    If ($details -match 'Authentication_RequestFromUnsupportedUserRole|Authorization_RequestDenied|AccessDenied|Forbidden|Authentication_MSGraphPermissionMissing|Authentication_RequestFromNonPremiumTenant')
     {
-        Return $null
+        return $true
     }
+    ForEach ($status in @($Record.Exception.ResponseStatusCode, $Record.Exception.StatusCode,
+        $Record.Exception.Response.StatusCode))
+    {
+        If ([string]$status -in @('403', 'Forbidden')) { return $true }
+    }
+    return $false
 }
 
 Function Get-AADRUser
@@ -2644,9 +3516,43 @@ Function Get-AADRUser
         [int] $Threads = 10
     )
 
+    $date = $date.ToUniversalTime()
     If ($Method -eq 'MSGraph')
     {
-        $AzureADUsers = @( Get-MgUser -All -Property accountEnabled, assignedLicenses, createdDateTime, department, displayName, jobTitle, mobilePhone, Id, telephone, userPrincipalName, userType, signInActivity, createdDateTime, lastPasswordChangeDateTime -PageSize $Pagesize)
+        $userProperties = @('accountEnabled', 'assignedLicenses', 'createdDateTime', 'department', 'displayName',
+            'jobTitle', 'mobilePhone', 'id', 'businessPhones', 'userPrincipalName', 'userType', 'lastPasswordChangeDateTime')
+        $signInActivityAvailable = $true
+        $mfaWarningShown = $false
+        $mfaUnavailableWarningShown = $false
+        $mfaConsecutiveFailures = 0
+        $mfaCircuitOpen = $false
+        $userRecordFailures = 0
+        $UserObj = @()
+        Try
+        {
+            $AzureADUsers = @(Invoke-AADRReadRequest -Query { Get-MgUser -All -Property ($userProperties + 'signInActivity') -PageSize ([Math]::Min($PageSize, 500)) -ErrorAction Stop })
+        }
+        Catch
+        {
+            If (-Not (Test-AADRGraphPermissionError -Record $_)) { throw }
+            $signInActivityAvailable = $false
+            Add-AADREvent -Operation 'Users signInActivity' -Status PermissionDenied -Detail 'Sign-in activity was denied; basic user collection retried.'
+            Write-Warning '[Get-AADRUser] Graph denied signInActivity access. Retrying basic user collection. Sign-in and dormancy fields will be blank (unknown). Sign-in activity requires AuditLog.Read.All, Entra ID P1/P2, and a supported role for delegated access (for example Reports Reader).'
+            Try
+            {
+                # A fresh request discards any partial pages from the failed query.
+                $AzureADUsers = @(Invoke-AADRReadRequest -Query { Get-MgUser -All -Property $userProperties -PageSize $PageSize -ErrorAction Stop })
+            }
+            Catch
+            {
+                If (-Not (Test-AADRGraphPermissionError -Record $_)) { throw }
+                Add-AADREvent -Operation Users -Status PermissionDenied -Detail 'Basic user access was denied.'
+                Write-Warning '[Get-AADRUser] Graph also denied basic user access. Users were not collected. Check User.Read.All or Directory.Read.All and the signed-in account permissions.'
+                return $null
+            }
+        }
+        $registrationMap = @{}
+        ForEach ($registration in @(Get-AADRMFARegistration)) { If ($registration.id) { $registrationMap[[string]$registration.id] = $registration } }
         If($AzureADUsers)
         {
             $ProcessedUserCount = 0
@@ -2654,62 +3560,119 @@ Function Get-AADRUser
             $UserObj = @()
             $AzureADUsers | ForEach-Object {
                 $ProcessedUserCount++
+                $currentUser = $_
+                Try
+                {
+                # Graph can omit dates or return null; keep unavailable report values unknown.
+                $createdDateTime = ConvertTo-AADRDateTime $_.createdDateTime
+                $lastPasswordChange = ConvertTo-AADRDateTime $_.lastPasswordChangeDateTime
+                $lastSignIn = If ($signInActivityAvailable) { ConvertTo-AADRDateTime $_.signInActivity.lastSignInDateTime } Else { $null }
+                $lastNonInteractiveSignIn = If ($signInActivityAvailable) { ConvertTo-AADRDateTime $_.signInActivity.lastNonInteractiveSignInDateTime } Else { $null }
+                $lastSuccess = If ($signInActivityAvailable) { ConvertTo-AADRDateTime $_.signInActivity.lastSuccessfulSignInDateTime } Else { $null }
+                $successAge = If ($null -ne $lastSuccess) { [Math]::Max(0, [Math]::Floor(($Date.ToUniversalTime() - $lastSuccess.ToUniversalTime()).TotalDays)) } Else { $null }
+                $passwordAge = If ($null -ne $lastPasswordChange) { [Math]::Max(0, [Math]::Floor(($Date - $lastPasswordChange).TotalDays)) } Else { $null }
+
                 # Create the object for each instance.
                 $Obj = New-Object PSObject
-                $Obj | Add-Member -MemberType NoteProperty -Name "UserPrincipalName" -Value $([string] $_.UserPrincipalName)
-                $Obj | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value $([string] $_.DisplayName)
-                $Obj | Add-Member -MemberType NoteProperty -Name "Enabled" -Value $([bool] $_.accountEnabled)
-                $Obj | Add-Member -MemberType NoteProperty -Name "UserType" -Value $([string] $_.userType)
-                $Obj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value $([string] $_.JobTitle)
-                $Obj | Add-Member -MemberType NoteProperty -Name "Department" -Value $([string] $_.Department)
-                $Obj | Add-Member -MemberType NoteProperty -Name "Mobile" -Value $([string] $_.MobilePhone)
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Id' -Value $_.Id
+                $Obj | Add-Member -MemberType NoteProperty -Name "UserPrincipalName" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.UserPrincipalName)) { [string]$_.UserPrincipalName } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.DisplayName)) { [string]$_.DisplayName } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "Enabled" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.accountEnabled)) { [bool]$_.accountEnabled } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "UserType" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.userType)) { [string]$_.userType } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "JobTitle" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.JobTitle)) { [string]$_.JobTitle } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "Department" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.Department)) { [string]$_.Department } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "Mobile" -Value $(If (-Not [string]::IsNullOrWhiteSpace([string]$_.MobilePhone)) { [string]$_.MobilePhone } Else { $null })
 
-                If ([string]::IsNullOrEmpty($_.signInActivity.lastSignInRequestId))
-                {
-                    $NeverLoggedIn = $True
-                    $DaysSinceLastLogon = $null
-                }
-                Else
-                {
-                    $NeverLoggedIn = $False
-                    $DaysSinceLastLogon = [Math]::Abs(($Date - [DateTime]$_.signInActivity.lastSignInDateTime).Days)
-                }
+                # Missing sign-in history does not establish that a user has never signed in.
+                $NeverLoggedIn = If ($null -ne $lastSuccess) { $False } Else { $null }
+                $DaysSinceLastLogon = If ($null -ne $lastSignIn) { [Math]::Max(0, [Math]::Floor(($Date - $lastSignIn).TotalDays)) } Else { $null }
 
                 $Obj | Add-Member -MemberType NoteProperty -Name "Never Logged In" -Value $NeverLoggedIn
                 $Obj | Add-Member -MemberType NoteProperty -Name "Logon Age (days)" -Value $DaysSinceLastLogon
 
-                If ([string]::IsNullOrEmpty($_.signInActivity.lastNonInteractiveSignInRequestId))
-                {
-                    $NeverNonInteractiveLoggedIn = $True
-                    $DaysSinceLastNonInteractiveLogon = $null
-                }
-                Else
-                {
-                    $NeverNonInteractiveLoggedIn = $False
-                    $DaysSinceLastNonInteractiveLogon = [Math]::Abs(($Date - [DateTime]$_.signInActivity.lastNonInteractiveSignInDateTime).Days)
-                }
+                $NeverNonInteractiveLoggedIn = $null # Attempt history cannot establish successful non-interactive access.
+                $DaysSinceLastNonInteractiveLogon = If ($null -ne $lastNonInteractiveSignIn) { [Math]::Max(0, [Math]::Floor(($Date - $lastNonInteractiveSignIn).TotalDays)) } Else { $null }
 
-                $Obj | Add-Member -MemberType NoteProperty -Name $("Dormant (> " + $DormantTimeSpan + " days)") -Value $(If ($DaysSinceLastLogon -gt $DormantTimeSpan) { $True } Else { $False })
+                $Obj | Add-Member -MemberType NoteProperty -Name $("Dormant (> " + $DormantTimeSpan + " days)") -Value $(If ($null -eq $successAge) { $null } Else { $successAge -gt $DormantTimeSpan })
                 $Obj | Add-Member -MemberType NoteProperty -Name "Never Non-Interactive Logged In" -Value $NeverNonInteractiveLoggedIn
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Non-Interactive Attempt Recorded' -Value $(If ($null -ne $lastNonInteractiveSignIn) { $true } Else { $null })
                 $Obj | Add-Member -MemberType NoteProperty -Name "Non-Interactive Logon Age (days)" -Value $DaysSinceLastNonInteractiveLogon
-                $Obj | Add-Member -MemberType NoteProperty -Name "Password Age (days)" -Value $([Math]::Abs(($Date - [DateTime]$_.lastPasswordChangeDateTime).Days))
-                $Obj | Add-Member -MemberType NoteProperty -Name $("Password Age (>" + $PassMaxAge + " days)") -Value $(If (([Math]::Abs(($Date - [DateTime]$_.lastPasswordChangeDateTime).Days)) -gt $PassMaxAge) { $True } Else { $False })
-                $Obj | Add-Member -MemberType NoteProperty -Name "LastSignInDateTime" -Value $(If ($_.signInActivity.lastSignInDateTime -ne $null) { [DateTime]$_.signInActivity.lastSignInDateTime } Else { $null })
-                $Obj | Add-Member -MemberType NoteProperty -Name "LastNonInteractiveSignInDateTime" -Value $(If ($_.signInActivity.lastNonInteractiveSignInDateTime -ne $null) { [DateTime]$_.signInActivity.lastNonInteractiveSignInDateTime } Else { $null })
-                $Obj | Add-Member -MemberType NoteProperty -Name "lastPasswordChangeDateTime" -Value $(If ($_.lastPasswordChangeDateTime -ne $null) { [DateTime]$_.lastPasswordChangeDateTime } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name "Password Age (days)" -Value $passwordAge
+                $Obj | Add-Member -MemberType NoteProperty -Name $("Password Age (>" + $PassMaxAge + " days)") -Value $(If ($null -ne $passwordAge) { $passwordAge -gt $PassMaxAge } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name 'LastSuccessfulSignInDateTime' -Value $lastSuccess
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Successful Logon Age (days)' -Value $successAge
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Last Interactive Attempt' -Value $lastSignIn
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Last Non-Interactive Attempt' -Value $lastNonInteractiveSignIn
+                $Obj | Add-Member -MemberType NoteProperty -Name "LastSignInDateTime" -Value $lastSignIn
+                $Obj | Add-Member -MemberType NoteProperty -Name "LastNonInteractiveSignInDateTime" -Value $lastNonInteractiveSignIn
+                $Obj | Add-Member -MemberType NoteProperty -Name "lastPasswordChangeDateTime" -Value $lastPasswordChange
 
                 # GetMFAStatusReport.ps1 https://o365reports.com/2022/04/27/get-mfa-status-of-office-365-users-using-microsoft-graph-powershell
 
                 $Is3rdPartyAuthenticatorUsed = "False"
-                $MFAPhone = "-"
-                $MicrosoftAuthenticatorDevice = "-"
-                Write-Progress -Activity "`n Processed users count: $ProcessedUserCount Currently processing: $($_.DisplayName)`n"
-                [array]$MFAData = Get-MgUserAuthenticationMethod -UserId $_.Id
+                $MFAPhone = $null
+                $MicrosoftAuthenticatorDevice = $null
+                Write-Progress -Activity "`n Processed users count: $ProcessedUserCount Currently processing: $($_.DisplayName)`n" -ErrorAction SilentlyContinue
+                $mfaAvailable = $true
+                Try
+                {
+                    If ($mfaCircuitOpen -or [string]::IsNullOrWhiteSpace([string]$_.Id))
+                    {
+                        $mfaAvailable = $false
+                        $MFAData = @()
+                    }
+                    Else
+                    {
+                        # Capture the pipeline user before entering a nested request scope.
+                        $mfaUserId = $_.Id
+                        [array]$MFAData = @(Invoke-AADRReadRequest -Query { Get-MgUserAuthenticationMethod -UserId $mfaUserId -ErrorAction Stop })
+                        $mfaConsecutiveFailures = 0
+                    }
+                }
+                Catch
+                {
+                    If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }
+                    $mfaAvailable = $false
+                    $MFAData = @()
+                    If (Test-AADRGraphPermissionError -Record $_)
+                    {
+                        $mfaConsecutiveFailures = 0
+                        Add-AADREvent -Operation 'Users authentication methods' -Status PermissionDenied -Detail 'Authentication methods for a user were denied.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+                        If (-Not $mfaWarningShown)
+                        {
+                            Write-Warning '[Get-AADRUser] Graph denied authentication method access. Affected method details remain unknown. Registration/capability are independent. Check UserAuthenticationMethod.Read.All and the delegated role. Other users will still be queried.' -WarningAction Continue
+                            $mfaWarningShown = $true
+                        }
+                    }
+                    Else
+                    {
+                        Add-AADREvent -Operation 'Users authentication methods' -Status Unavailable -Detail 'Authentication methods for a user could not be collected; details remain unknown.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+                        If (-Not (Test-AADRGraphNotFoundError $_)) { $mfaConsecutiveFailures++ } Else { $mfaConsecutiveFailures = 0 }
+                        If (-Not $mfaUnavailableWarningShown)
+                        {
+                            Write-Warning '[Get-AADRUser] Authentication method requests failed after retry or a user was removed during collection. Affected details remain unknown; basic user collection continues.' -WarningAction Continue
+                            $mfaUnavailableWarningShown = $true
+                        }
+                        If ($mfaConsecutiveFailures -ge 5)
+                        {
+                            $mfaCircuitOpen = $true
+                            Add-AADREvent -Operation 'Users authentication methods' -Status Unavailable -Detail 'Five consecutive method request failures after retries. Remaining method lookups were skipped; basic users and registration/capability remain independent.'
+                            Write-Warning '[Get-AADRUser] Repeated authentication method failures. Skipping remaining method lookups for this collector; their details will remain unknown.' -WarningAction Continue
+                        }
+                    }
+                }
                 $AuthenticationMethod = @()
                 $AdditionalDetails = @()
 
                 foreach ($MFA in $MFAData)
                 {
+                    $AuthMethod = $null
+                    $AuthMethodDetails = $null
+                    If ($null -eq $MFA -or $null -eq $MFA.AdditionalProperties)
+                    {
+                        $mfaAvailable = $false
+                        continue
+                    }
                     Switch ($MFA.AdditionalProperties["@odata.type"])
                     {
                         "#microsoft.graph.passwordAuthenticationMethod" {
@@ -2743,7 +3706,7 @@ Function Get-AADRUser
                             $AuthMethod = 'EmailAuthentication'
                             $AuthMethodDetails = $MFA.AdditionalProperties["emailAddress"]
                         }
-                        "microsoft.graph.temporaryAccessPassAuthenticationMethod" {
+                        "#microsoft.graph.temporaryAccessPassAuthenticationMethod" {
                             # Temporary Access pass
                             $AuthMethod = 'TemporaryAccessPass'
                             $AuthMethodDetails = 'Access pass lifetime (minutes): ' + $MFA.AdditionalProperties["lifetimeInMinutes"]
@@ -2757,7 +3720,7 @@ Function Get-AADRUser
                             $AuthMethod = 'SoftwareOath'
                             $Is3rdPartyAuthenticatorUsed = "True"
                         }
-
+                        default { $mfaAvailable = $false }
                     }
                     $AuthenticationMethod += $AuthMethod
                     If ($AuthMethodDetails -ne $null)
@@ -2770,36 +3733,54 @@ Function Get-AADRUser
                 $AuthenticationMethod =$AuthenticationMethod | Sort-Object | Get-Unique
                 $AuthenticationMethods= $AuthenticationMethod  -join ","
                 $AdditionalDetail=$AdditionalDetails -join ", "
-                #Determine MFA status
-                [array]$StrongMFAMethods=("Fido2","PhoneAuthentication","PasswordlessMSAuthenticator","AuthenticatorApp","WindowsHelloForBusiness")
-                $MFAStatus="Disabled"
+                # Registration/capability are report facts; method presence is not enforcement.
+                $registration = $registrationMap[[string]$_.Id]
+                $mfaRegistered = Get-AADRProperty $registration 'isMfaRegistered'
+                $mfaCapable = Get-AADRProperty $registration 'isMfaCapable'
+                $MFAStatus = If ($null -eq $mfaRegistered) { 'Unknown' } ElseIf ($mfaRegistered) { 'Registered' } Else { 'NotRegistered' }
+                $Obj | Add-Member -MemberType NoteProperty -Name 'MFA Registered' -Value $mfaRegistered
+                $Obj | Add-Member -MemberType NoteProperty -Name 'MFA Capable' -Value $mfaCapable
+                $Obj | Add-Member -MemberType NoteProperty -Name 'MFA Enforcement' -Value 'NotEvaluated'
+                $Obj | Add-Member -MemberType NoteProperty -Name 'MFA Enforcement Evidence' -Value 'Registration does not prove enforcement; evaluate Conditional Access and security defaults for the resource/sign-in context.'
 
-                ForEach($StrongMFAMethod in $StrongMFAMethods)
+                If (-Not $mfaAvailable)
                 {
-                    If ($AuthenticationMethod -contains $StrongMFAMethod)
-                    {
-                        $MFAStatus="Strong"
-                        break
-                    }
+                    $AuthenticationMethods = $null
+                    $AdditionalDetail = $null
+                    $MFAPhone = $null
+                    $MicrosoftAuthenticatorDevice = $null
+                    $Is3rdPartyAuthenticatorUsed = $null
                 }
 
-                If (($MFAStatus -ne "Strong") -and ($AuthenticationMethod -contains "SoftwareOath"))
-                {
-                    $MFAStatus="Weak"
-                }
-
+                If (-Not $mfaAvailable) { Add-AADREvent -Operation 'Users authentication methods' -Status Unavailable -Detail 'User authentication method details are incomplete.' }
                 $Obj | Add-Member -MemberType NoteProperty -Name "MFAStatus" -Value $MFAStatus
                 $Obj | Add-Member -MemberType NoteProperty -Name "AuthenticationMethods" -Value $AuthenticationMethods
                 $Obj | Add-Member -MemberType NoteProperty -Name "MFA Phone" -Value $MFAPhone
                 $Obj | Add-Member -MemberType NoteProperty -Name "Microsoft Authenticator Configured Device" -Value $MicrosoftAuthenticatorDevice
                 $Obj | Add-Member -MemberType NoteProperty -Name "Is 3rd-Party Authenticator Used" -Value $Is3rdPartyAuthenticatorUsed
                 $Obj | Add-Member -MemberType NoteProperty -Name "Additional Details" -Value $AdditionalDetail
-                $Obj | Add-Member -MemberType NoteProperty -Name "whenCreated" -Value $([DateTime] $([DateTime]($_.createdDateTime)))
-                $Obj | Add-Member -MemberType NoteProperty -Name "Assigned Licenses (Count)" -Value $($_.assignedLicenses.Count)
+                $Obj | Add-Member -MemberType NoteProperty -Name "whenCreated" -Value $createdDateTime
+                $Obj | Add-Member -MemberType NoteProperty -Name "Assigned Licenses (Count)" -Value $(If ($null -ne $_.assignedLicenses) { @($_.assignedLicenses).Count } Else { $null })
+                $Obj | Add-Member -MemberType NoteProperty -Name 'Authentication Methods Collection Status' -Value $(If ($mfaAvailable) {'Collected'} Else {'Unknown'})
                 $UserObj += $Obj
+                }
+                Catch
+                {
+                    If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }
+                    $userRecordFailures++
+                    $recordDiagnostic = Get-AADRErrorDiagnostic $_
+                    $rowId = $null
+                    Try { $rowId = Get-AADRProperty $currentUser 'Id' } Catch { }
+                    $UserObj += [pscustomobject]@{Id=$rowId; CollectionStatus='Unknown'; CollectionError=$recordDiagnostic.Category; MFAStatus='Unknown'; 'Authentication Methods Collection Status'='Unknown'}
+                }
             }
-            Write-Progress -Activity "Processed users" -Completed
-            Remove-Variable AzureADUsers
+            If ($userRecordFailures -gt 0)
+            {
+                Add-AADREvent -Operation 'Users records' -Status Unavailable -Detail "$userRecordFailures user record(s) could not be processed; known IDs and unknown status markers are retained."
+                Write-Warning "[Get-AADRUser] $userRecordFailures user record(s) could not be processed. Unknown rows retain their known IDs; other users were processed." -WarningAction Continue
+            }
+            Write-Progress -Activity "Processed users" -Completed -ErrorAction SilentlyContinue
+            Remove-Variable AzureADUsers -ErrorAction SilentlyContinue
         }
     }
 
@@ -2848,6 +3829,13 @@ Function Get-AADRServicePrincipal
         [int] $Threads = 10
     )
 
+    $ServicePrincipalObj = $null
+    If ($Method -eq 'MSGraph')
+    {
+        $records = @(Invoke-AADRGraphCollection -Name 'Get-AADRServicePrincipal' -Query { Get-MgServicePrincipal -All -Property id,appId,displayName,accountEnabled,publisherName,servicePrincipalNames,replyUrls,logoutUrl,oauth2PermissionScopes -ErrorAction Stop })
+        If ($records.Count -gt 0) { $ServicePrincipalObj = $script:AADRParserType::ServicePrincipalParser($records, $Threads) }
+    }
+
     If ($ServicePrincipalObj)
     {
         Return $ServicePrincipalObj
@@ -2893,14 +3881,15 @@ Function Get-AADRDirectoryRole
         [int] $Threads = 10
     )
 
+    $AADRDirectoryRolesObj = $null
     If ($Method -eq 'MSGraph')
     {
-        $AADRDirectoryRoles = @( Get-MgDirectoryRole -All)
+        $AADRDirectoryRoles = @(Invoke-AADRGraphCollection -Name 'Get-AADRDirectoryRole' -Query { Get-MgDirectoryRole -All -ErrorAction Stop })
         If ($AADRDirectoryRoles)
         {
             Write-Verbose "[*] Total DirectoryRoles: $($AADRDirectoryRoles.Count)"
-            $AADRDirectoryRolesObj = [AADRecon.AzureADClass]::DirectoryRoleParser($AADRDirectoryRoles, $Threads)
-            Remove-Variable AADRDirectoryRoles
+            $AADRDirectoryRolesObj = $script:AADRParserType::DirectoryRoleParser($AADRDirectoryRoles, $Threads)
+            Remove-Variable AADRDirectoryRoles -ErrorAction SilentlyContinue
         }
     }
 
@@ -2912,6 +3901,15 @@ Function Get-AADRDirectoryRole
     {
         Return $null
     }
+}
+
+Function Get-AADRMemberProperty
+{
+    param([Parameter(Mandatory = $true)] $Member, [Parameter(Mandatory = $true)] [string] $Name)
+    $property = $Member.PSObject.Properties[$Name]
+    If ($property -and $null -ne $property.Value) { return $property.Value }
+    If ($Member.AdditionalProperties) { return $Member.AdditionalProperties[$Name] }
+    return $null
 }
 
 Function Get-AADRDirectoryRoleMember
@@ -2949,60 +3947,70 @@ Function Get-AADRDirectoryRoleMember
         [int] $Threads = 10
     )
 
-    If ($Method -eq 'MSGraph')
+    If ($Method -ne 'MSGraph') { return $null }
+    $parents = @(Invoke-AADRGraphCollection -Name 'Get-AADRDirectoryRoleMember' -Query { Get-MgDirectoryRole -All -ErrorAction Stop })
+    Try
     {
-        $AADRDirectoryRoles = @( Get-MgDirectoryRole -All)
-        If ($AADRDirectoryRoles)
+        ForEach ($parent in $parents)
         {
-            $ProcessedDirectoryRoleCount = 0
-            Write-Verbose "[*] Total DirectoryRoles: $($AADRDirectoryRoles.Count)"
-            $AADRDirectoryRoleMemberObj = @()
-            $AADRDirectoryRoles | ForEach-Object {
-                $ProcessedDirectoryRoleCount++
-                $AADRDirectoryRoleMember = Get-MgDirectoryRoleMember -DirectoryRoleId $_.Id
-                $DirectoryRoleName = $([AADRecon.AzureADClass]::CleanString($_.DisplayName))
-                If ($AADRDirectoryRoleMember)
+            $parentName = $script:AADRParserType::CleanString($parent.DisplayName)
+            $state = @{Available = $false}
+            $members = @()
+            If (-Not [string]::IsNullOrWhiteSpace([string]$parent.Id))
+            {
+                $members = @(Invoke-AADRGraphCollection -Name 'Get-AADRDirectoryRoleMember membership' -State $state -Query { Get-MgDirectoryRoleMember -DirectoryRoleId $parent.Id -All -ErrorAction Stop })
+            }
+            Else { Write-Warning '[Get-AADRDirectoryRoleMember] Parent ID is unavailable. Membership remains unknown.' }
+            If (-Not $state.Available)
+            {
+                # An explicit status row distinguishes denied membership from a known empty group/role.
+                [pscustomobject][ordered]@{
+                    DirectoryRole = $parentName; MemberName = $null; MemberUserPrincipalName = $null
+                    DirectoryRoleId = $parent.Id; MemberId = $null; Type = $null; CollectionStatus = 'Unknown'
+                }
+                continue
+            }
+            ForEach ($member in $members)
+            {
+                $name = $script:AADRParserType::CleanString((Get-AADRMemberProperty -Member $member -Name 'displayName'))
+                $upn = $script:AADRParserType::CleanString((Get-AADRMemberProperty -Member $member -Name 'userPrincipalName'))
+                $rawType = Get-AADRMemberProperty -Member $member -Name '@odata.type'
+                $type = switch ($rawType)
                 {
-                    $AADRDirectoryRoleMember | ForEach-Object {
-                        # Create the object for each instance.
-                        $Obj = New-Object PSObject
-                        $Obj | Add-Member -MemberType NoteProperty -Name DirectoryRole -Value $DirectoryRoleName
-                        If ($_.AdditionalProperties."@odata.type" -eq "#microsoft.graph.user")
+                    '#microsoft.graph.user' { 'User' }
+                    '#microsoft.graph.group' { 'Group' }
+                    '#microsoft.graph.servicePrincipal' { 'ServicePrincipal' }
+                    '#microsoft.graph.device' { 'Device' }
+                    default { $rawType }
+                }
+                    # Limited-information members retain their IDs even if details are denied.
+                    If ($member.Id -and ($type -eq 'User' -or $type -eq 'Group') -and
+                        ([string]::IsNullOrWhiteSpace($name) -or ($type -eq 'User' -and [string]::IsNullOrWhiteSpace($upn))))
+                    {
+                        $detailState = @{}
+                        $details = If ($type -eq 'User')
                         {
-                            $UserDetails = Get-MgUser -UserId $_.Id
-                            $Obj | Add-Member -MemberType NoteProperty -Name MemberName -Value $([AADRecon.AzureADClass]::CleanString($UserDetails.DisplayName))
-                            $Obj | Add-Member -MemberType NoteProperty -Name MemberUserPrincipalName -Value $([AADRecon.AzureADClass]::CleanString($UserDetails.UserPrincipalName))
-                            $Obj | Add-Member -MemberType NoteProperty -Name Type -Value "User"
-                            $AADRDirectoryRoleMemberObj += $Obj
+                            Invoke-AADRGraphCollection -Name 'Get-AADRDirectoryRoleMember user details' -AllowNotFound -State $detailState -Query { Get-MgUser -UserId $member.Id -ErrorAction Stop }
                         }
-                        If ($_.AdditionalProperties."@odata.type" -eq "#microsoft.graph.group")
+                        Else
                         {
-                            $GroupDetails = Get-MgGroup -GroupId $_.Id
-                            $Obj | Add-Member -MemberType NoteProperty -Name MemberName -Value $([AADRecon.AzureADClass]::CleanString($GroupDetails.DisplayName))
-                            $Obj | Add-Member -MemberType NoteProperty -Name MemberUserPrincipalName -Value ""
-                            $Obj | Add-Member -MemberType NoteProperty -Name Type -Value "Group"
-                            $AADRDirectoryRoleMemberObj += $Obj
+                            Invoke-AADRGraphCollection -Name 'Get-AADRDirectoryRoleMember group details' -AllowNotFound -State $detailState -Query { Get-MgGroup -GroupId $member.Id -ErrorAction Stop }
                         }
-                        Write-Progress -Activity "`n Processed DirectoryRole count: $ProcessedDirectoryRoleCount Currently processing: $($DirectoryRoleName)`n"
+                        If ($details)
+                        {
+                            If ([string]::IsNullOrWhiteSpace($name)) { $name = $script:AADRParserType::CleanString($details.DisplayName) }
+                            If ($type -eq 'User' -and [string]::IsNullOrWhiteSpace($upn)) { $upn = $script:AADRParserType::CleanString($details.UserPrincipalName) }
+                        }
                     }
+                [pscustomobject][ordered]@{
+                    DirectoryRole = $parentName; MemberName = $name; MemberUserPrincipalName = $upn
+                    DirectoryRoleId = $parent.Id; MemberId = $member.Id; Type = $type; CollectionStatus = 'Collected'
                 }
             }
-            Write-Progress -Activity "Processed DirectoryRole" -Completed
-            Remove-Variable ProcessedDirectoryRoleCount
-            Remove-Variable AADRDirectoryRoles
-            Remove-Variable AADRDirectoryRoleMember
-            Remove-Variable DirectoryRoleName
+            Write-Progress -Activity 'Processing DirectoryRole membership' -Status $(If ([string]::IsNullOrWhiteSpace($parentName)) {'Unnamed object'} Else {$parentName}) -ErrorAction SilentlyContinue
         }
     }
-
-    If ($AADRDirectoryRoleMemberObj)
-    {
-        Return $AADRDirectoryRoleMemberObj
-    }
-    Else
-    {
-        Return $null
-    }
+    Finally { Write-Progress -Activity 'Processing DirectoryRole membership' -Completed }
 }
 
 Function Get-AADRGroup
@@ -3047,14 +4055,15 @@ Function Get-AADRGroup
         [int] $Threads = 10
     )
 
+    $AADRGroupsObj = $null
     If ($Method -eq 'MSGraph')
     {
-        $AADRGroups = @( Get-MgGroup -All -PageSize $PageSize )
+        $AADRGroups = @(Invoke-AADRGraphCollection -Name 'Get-AADRGroup' -Query { Get-MgGroup -All -PageSize $PageSize -ErrorAction Stop })
         If($AADRGroups)
         {
-            Write-Verbose "[*] Total Groups: $([AADRecon.AzureADClass]::ObjectCount($AADRGroups))"
-            $AADRGroupsObj = [AADRecon.AzureADClass]::GroupParser($AADRGroups, $Threads)
-            Remove-Variable AADRGroups
+            Write-Verbose "[*] Total Groups: $($script:AADRParserType::ObjectCount($AADRGroups))"
+            $AADRGroupsObj = $script:AADRParserType::GroupParser($AADRGroups, $Threads)
+            Remove-Variable AADRGroups -ErrorAction SilentlyContinue
         }
     }
 
@@ -3103,46 +4112,51 @@ Function Get-AADRGroupMember
         [int] $Threads = 10
     )
 
-    If ($Method -eq 'MSGraph')
+    If ($Method -ne 'MSGraph') { return $null }
+    $parents = @(Invoke-AADRGraphCollection -Name 'Get-AADRGroupMember' -Query { Get-MgGroup -All -ErrorAction Stop -PageSize $PageSize })
+    Try
     {
-        $AADRGroups = @( Get-MgGroup -All -PageSize $PageSize )
-        If($AADRGroups)
+        ForEach ($parent in $parents)
         {
-            $ProcessedGroupCount = 0
-            Write-Verbose "[*] Total Groups: $([AADRecon.AzureADClass]::ObjectCount($AADRGroups))"
-            $AADRGroupMemberObj = @()
-            $AADRGroups | ForEach-Object {
-                $ProcessedGroupCount++
-                $AADRGroupMemberMember = Get-MgGroupMember -GroupId $_.Id
-                $GroupName = $([AADRecon.AzureADClass]::CleanString($_.DisplayName))
-                If ($AADRGroupMemberMember)
-                {
-                    $AADRGroupMemberMember | ForEach-Object {
-                        # Create the object for each instance.
-                        $Obj = New-Object PSObject
-                        $Obj | Add-Member -MemberType NoteProperty -Name GroupName -Value $GroupName
-                        $Obj | Add-Member -MemberType NoteProperty -Name MemberName -Value $([AADRecon.AzureADClass]::CleanString($_.AdditionalProperties.displayName))
-                        $Obj | Add-Member -MemberType NoteProperty -Name MemberUserPrincipalName -Value $([AADRecon.AzureADClass]::CleanString($_.AdditionalProperties.userPrincipalName))
-                        $AADRGroupMemberObj += $Obj
-                    }
-                }
-                Write-Progress -Activity "`n Processed Group count: $ProcessedGroupCount Currently processing: $($GroupName)`n"
+            $parentName = $script:AADRParserType::CleanString($parent.DisplayName)
+            $state = @{Available = $false}
+            $members = @()
+            If (-Not [string]::IsNullOrWhiteSpace([string]$parent.Id))
+            {
+                $members = @(Invoke-AADRGraphCollection -Name 'Get-AADRGroupMember membership' -State $state -Query { Get-MgGroupMember -GroupId $parent.Id -All -ErrorAction Stop })
             }
-            Write-Progress -Activity "Processed Group" -Completed
-            Remove-Variable AADRGroups
-            Remove-Variable AADRGroupMemberMember
-            Remove-Variable GroupName
+            Else { Write-Warning '[Get-AADRGroupMember] Parent ID is unavailable. Membership remains unknown.' }
+            If (-Not $state.Available)
+            {
+                # An explicit status row distinguishes denied membership from a known empty group/role.
+                [pscustomobject][ordered]@{
+                    GroupName = $parentName; MemberName = $null; MemberUserPrincipalName = $null
+                    GroupId = $parent.Id; MemberId = $null; Type = $null; CollectionStatus = 'Unknown'
+                }
+                continue
+            }
+            ForEach ($member in $members)
+            {
+                $name = $script:AADRParserType::CleanString((Get-AADRMemberProperty -Member $member -Name 'displayName'))
+                $upn = $script:AADRParserType::CleanString((Get-AADRMemberProperty -Member $member -Name 'userPrincipalName'))
+                $rawType = Get-AADRMemberProperty -Member $member -Name '@odata.type'
+                $type = switch ($rawType)
+                {
+                    '#microsoft.graph.user' { 'User' }
+                    '#microsoft.graph.group' { 'Group' }
+                    '#microsoft.graph.servicePrincipal' { 'ServicePrincipal' }
+                    '#microsoft.graph.device' { 'Device' }
+                    default { $rawType }
+                }
+                [pscustomobject][ordered]@{
+                    GroupName = $parentName; MemberName = $name; MemberUserPrincipalName = $upn
+                    GroupId = $parent.Id; MemberId = $member.Id; Type = $type; CollectionStatus = 'Collected'
+                }
+            }
+            Write-Progress -Activity 'Processing Group membership' -Status $(If ([string]::IsNullOrWhiteSpace($parentName)) {'Unnamed object'} Else {$parentName}) -ErrorAction SilentlyContinue
         }
     }
-
-    If ($AADRGroupMemberObj)
-    {
-        Return $AADRGroupMemberObj
-    }
-    Else
-    {
-        Return $null
-    }
+    Finally { Write-Progress -Activity 'Processing Group membership' -Completed }
 }
 
 Function Get-AADRDevice
@@ -3173,13 +4187,14 @@ Function Get-AADRDevice
         [int] $Threads = 10
     )
 
+    $AADRDevicesObj = $null
     If ($Method -eq 'MSGraph')
     {
-        $AADRDevices = @( Get-MgDevice -All )
+        $AADRDevices = @(Invoke-AADRGraphCollection -Name 'Get-AADRDevice' -Query { Get-MgDevice -All -ErrorAction Stop })
         If ($AADRDevices)
         {
-            Write-Verbose "[*] Total Devices: $([AADRecon.AzureADClass]::ObjectCount($AADRDevices))"
-            $AADRDevicesObj = [AADRecon.AzureADClass]::DeviceParser($AADRDevices, $Threads)
+            Write-Verbose "[*] Total Devices: $($script:AADRParserType::ObjectCount($AADRDevices))"
+            $AADRDevicesObj = $script:AADRParserType::DeviceParser($AADRDevices, $Threads)
             <#
             $AADRDevicesObj = @()
             $AADRDevices | ForEach-Object {
@@ -3202,7 +4217,7 @@ Function Get-AADRDevice
                 $AADRDevicesObj += $Obj
             }
             #>
-            Remove-Variable AADRDevices
+            Remove-Variable AADRDevices -ErrorAction SilentlyContinue
         }
     }
 
@@ -3244,7 +4259,7 @@ Function Convert-ADRGuidArray {
     If (-not $Values) { return '' }
     ($Values | ForEach-Object {
         $tok = [string] $_
-        If ($Map -and $Map.ContainsKey($tok)) { "$($Map[$tok]) ($tok)" } Else { $tok }
+        If ($Map -and $Map.ContainsKey($tok) -and -Not [string]::IsNullOrWhiteSpace([string]$Map[$tok])) { "$($Map[$tok]) ($tok)" } Else { $tok }
     }) -join ', '
 }
 
@@ -3272,15 +4287,9 @@ Function Get-AADRConditionalAccessPolicy {
         [string] $Method
     )
 
+    $AADRCAPoliciesObj = $null
     If ($Method -eq 'MSGraph') {
-        Try {
-            $AADRCAPolicies = @( Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop )
-        }
-        Catch {
-            Write-Warning "[Get-AADRConditionalAccessPolicy] Error retrieving Conditional Access Policies. Ensure the Policy.Read.All scope is granted."
-            Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
-            Return $null
-        }
+        $AADRCAPolicies = @(Invoke-AADRGraphCollection -Name ConditionalAccessPolicies -Query { Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop })
 
         If ($AADRCAPolicies) {
             Write-Verbose "[*] Total Conditional Access Policies: $($AADRCAPolicies.Count)"
@@ -3289,12 +4298,12 @@ Function Get-AADRConditionalAccessPolicy {
             $RoleMap = @{}; $LocationMap = @{}; $GroupMap = @{}; $UserMap = @{}; $AppMap = @{}
 
             # Directory role templates cover the roles referenced by CA policies - single call.
-            Try { Get-MgDirectoryRoleTemplate -All -ErrorAction Stop | ForEach-Object { $RoleMap[[string] $_.Id] = $_.DisplayName } }
-            Catch { Write-Verbose "[Get-AADRConditionalAccessPolicy] Could not enumerate directory role templates (Directory.Read.All?). $($_.Exception.Message)" }
+            Try { Invoke-AADRReadRequest -Query { Get-MgDirectoryRoleTemplate -All -ErrorAction Stop } | ForEach-Object { $RoleMap[[string] $_.Id] = $_.DisplayName } }
+            Catch { If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }; Add-AADREvent -Operation 'Conditional Access reference labels' -Status Unavailable -Detail 'A reference label could not be resolved; IDs are retained.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning "[Get-AADRConditionalAccessPolicy] Could not enumerate directory role templates (Directory.Read.All?). $((Get-AADRErrorDiagnostic $_).Category)" }
 
             # Named locations - single call.
-            Try { Get-MgIdentityConditionalAccessNamedLocation -All -ErrorAction Stop | ForEach-Object { $LocationMap[[string] $_.Id] = $_.DisplayName } }
-            Catch { Write-Verbose "[Get-AADRConditionalAccessPolicy] Could not enumerate named locations. $($_.Exception.Message)" }
+            Try { Invoke-AADRReadRequest -Query { Get-MgIdentityConditionalAccessNamedLocation -All -ErrorAction Stop } | ForEach-Object { $LocationMap[[string] $_.Id] = $_.DisplayName } }
+            Catch { If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }; Add-AADREvent -Operation 'Conditional Access reference labels' -Status Unavailable -Detail 'A reference label could not be resolved; IDs are retained.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning "[Get-AADRConditionalAccessPolicy] Could not enumerate named locations. $((Get-AADRErrorDiagnostic $_).Category)" }
 
             # Well-known first-party Microsoft application IDs (resolved without a Graph call).
             $WellKnownApps = @{
@@ -3321,17 +4330,17 @@ Function Get-AADRConditionalAccessPolicy {
             }
 
             ForEach ($gid in $GroupIds) {
-                Try { $GroupMap[$gid] = (Get-MgGroup -GroupId $gid -ErrorAction Stop).DisplayName }
-                Catch { Write-Verbose "[Get-AADRConditionalAccessPolicy] Could not resolve group $gid. $($_.Exception.Message)" }
+                Try { $GroupMap[$gid] = (Invoke-AADRReadRequest -Query { Get-MgGroup -GroupId $gid -ErrorAction Stop }).DisplayName }
+                Catch { If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }; Add-AADREvent -Operation 'Conditional Access reference labels' -Status Unavailable -Detail 'A reference label could not be resolved; IDs are retained.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning "[Get-AADRConditionalAccessPolicy] Could not resolve group $gid. $((Get-AADRErrorDiagnostic $_).Category)" }
             }
             ForEach ($uid in $UserIds) {
-                Try { $u = Get-MgUser -UserId $uid -ErrorAction Stop; $UserMap[$uid] = $(If ($u.UserPrincipalName) { $u.UserPrincipalName } Else { $u.DisplayName }) }
-                Catch { Write-Verbose "[Get-AADRConditionalAccessPolicy] Could not resolve user $uid. $($_.Exception.Message)" }
+                Try { $u = Invoke-AADRReadRequest -Query { Get-MgUser -UserId $uid -ErrorAction Stop }; $UserMap[$uid] = $(If ($u.UserPrincipalName) { $u.UserPrincipalName } Else { $u.DisplayName }) }
+                Catch { If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }; Add-AADREvent -Operation 'Conditional Access reference labels' -Status Unavailable -Detail 'A reference label could not be resolved; IDs are retained.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning "[Get-AADRConditionalAccessPolicy] Could not resolve user $uid. $((Get-AADRErrorDiagnostic $_).Category)" }
             }
             ForEach ($aid in $AppIds) {
                 If ($WellKnownApps.ContainsKey($aid)) { $AppMap[$aid] = $WellKnownApps[$aid]; continue }
-                Try { $sp = @( Get-MgServicePrincipal -Filter "appId eq '$aid'" -ErrorAction Stop ) | Select-Object -First 1; If ($sp) { $AppMap[$aid] = $sp.DisplayName } }
-                Catch { Write-Verbose "[Get-AADRConditionalAccessPolicy] Could not resolve application $aid. $($_.Exception.Message)" }
+                Try { $sp = @(Invoke-AADRReadRequest -Query { Get-MgServicePrincipal -Filter "appId eq '$aid'" -ErrorAction Stop }) | Select-Object -First 1; If ($sp) { $AppMap[$aid] = $sp.DisplayName } }
+                Catch { If ((Test-AADRControlFlowError $_) -or (Test-AADRGraphAuthenticationError $_)) { throw }; Add-AADREvent -Operation 'Conditional Access reference labels' -Status Unavailable -Detail 'A reference label could not be resolved; IDs are retained.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning "[Get-AADRConditionalAccessPolicy] Could not resolve application $aid. $((Get-AADRErrorDiagnostic $_).Category)" }
             }
 
             $AADRCAPoliciesObj = @()
@@ -3368,7 +4377,7 @@ Function Get-AADRConditionalAccessPolicy {
                 $Obj | Add-Member -MemberType NoteProperty -Name "Id" -Value $([string] $_.Id)
                 $AADRCAPoliciesObj += $Obj
             }
-            Remove-Variable AADRCAPolicies
+            Remove-Variable AADRCAPolicies -ErrorAction SilentlyContinue
         }
     }
 
@@ -3382,72 +4391,477 @@ Function Get-AADRConditionalAccessPolicy {
 
 Function Remove-EmptyAADROutputDir
 {
-<#
-.SYNOPSIS
-    Removes AzureADRecon output folder if empty.
+    param([string] $AADROutputDir, [array] $OutputType)
+    ForEach ($format in @('CSV','XML','JSON','HTML'))
+    {
+        $directory = Join-Path $AADROutputDir ($format + '-Files')
+        If ((Test-Path -LiteralPath $directory) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0)
+        { Remove-Item -LiteralPath $directory -Force }
+    }
+    If ((Test-Path -LiteralPath $AADROutputDir) -and @(Get-ChildItem -LiteralPath $AADROutputDir -Force).Count -eq 0)
+    { Remove-Item -LiteralPath $AADROutputDir -Force }
+}
 
-.DESCRIPTION
-    Removes AzureADRecon output folder if empty.
-
-.PARAMETER AADROutputDir
-    [string]
-	Path for AzureADRecon output folder.
-
-.PARAMETER OutputType
-    [array]
-    Output Type.
-#>
+Function ConvertTo-AADRGraphAccessToken
+{
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string] $AADROutputDir,
-
-        [Parameter(Mandatory = $true)]
-        [array] $OutputType
+        [AllowNull()]
+        [AllowEmptyString()]
+        $Token
     )
 
-    Switch ($OutputType)
+    # Accept provider responses without stringifying objects or mixed pipeline output.
+    If ($null -eq $Token -or $Token -is [array])
     {
-        'CSV'
+        throw "AccessToken must contain exactly one token, not an array of tokens or status messages."
+    }
+    If ($Token -isnot [string] -and $Token -isnot [System.Security.SecureString])
+    {
+        $tokenProperty = $null
+        ForEach ($name in @('access_token', 'AccessToken', 'Token'))
         {
-            $CSVPath  = -join($AADROutputDir,'\','CSV-Files')
-            If (!(Test-Path -Path $CSVPath\*))
+            If ($Token -is [System.Collections.IDictionary] -and $Token.Contains($name))
             {
-                Write-Verbose "Removed Empty Directory $CSVPath"
-                Remove-Item $CSVPath
+                $tokenProperty = $Token[$name]
+                break
+            }
+            If ($Token.PSObject.Properties[$name])
+            {
+                $tokenProperty = $Token.PSObject.Properties[$name].Value
+                break
             }
         }
-        'XML'
+        $Token = $tokenProperty
+    }
+
+    If ($Token -is [System.Security.SecureString])
+    {
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Token)
+        Try
         {
-            $XMLPath  = -join($AADROutputDir,'\','XML-Files')
-            If (!(Test-Path -Path $XMLPath\*))
-            {
-                Write-Verbose "Removed Empty Directory $XMLPath"
-                Remove-Item $XMLPath
-            }
+            $rawToken = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
         }
-        'JSON'
+        Finally
         {
-            $JSONPath  = -join($AADROutputDir,'\','JSON-Files')
-            If (!(Test-Path -Path $JSONPath\*))
-            {
-                Write-Verbose "Removed Empty Directory $JSONPath"
-                Remove-Item $JSONPath
-            }
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
-        'HTML'
+    }
+    ElseIf ($Token -is [string])
+    {
+        $rawToken = $Token
+    }
+    Else
+    {
+        throw "AccessToken must be a string, SecureString, or a provider response with a Token, AccessToken, or access_token property."
+    }
+
+    # Normalize common copy/paste wrappers; never merge status text into a token.
+    $rawToken = $rawToken.Trim().Trim([char[]]@([char]34, [char]39)).Trim()
+    $rawToken = $rawToken -replace '^(?i)Bearer\s+', ''
+    $rawToken = $rawToken.Trim().Trim([char[]]@([char]34, [char]39)).Trim()
+    If ([string]::IsNullOrWhiteSpace($rawToken) -or $rawToken -match '[\s\p{Cc}]' -or
+        $rawToken -in @('System.Security.SecureString', 'Bearer'))
+    {
+        throw "AccessToken is empty or contains invalid text. Supply only the Microsoft Graph access token, without status messages or serialized objects."
+    }
+
+    # Graph owns token validation: its access tokens are not necessarily three-part JWTs.
+    ConvertTo-SecureString -String $rawToken -AsPlainText -Force
+}
+
+Function ConvertTo-AADRTokenLease
+{
+    param([Parameter(Mandatory = $true)] $Token, $ExpiresOn)
+    $expiry = $ExpiresOn
+    If ($null -eq $expiry)
+    {
+        ForEach ($name in @('ExpiresOn', 'ExpiresOnUtc', 'expires_on'))
         {
-            $HTMLPath  = -join($AADROutputDir,'\','HTML-Files')
-            If (!(Test-Path -Path $HTMLPath\*))
+            $expiry = Get-AADRProperty $Token $name
+            If ($null -ne $expiry) { break }
+        }
+    }
+    $expiresUtc = $null
+    If ($null -ne $expiry)
+    {
+        Try
+        {
+            # OAuth v1 expires_on is Unix seconds; Az/MSAL ExpiresOn is a date.
+            If ($expiry -is [DateTimeOffset]) { $expiresUtc = $expiry.UtcDateTime }
+            ElseIf ($expiry -is [DateTime]) { $expiresUtc = $expiry.ToUniversalTime() }
+            ElseIf ([string]$expiry -match '^\d{9,12}$') { $expiresUtc = [DateTime]::SpecifyKind([datetime]'1970-01-01', [DateTimeKind]::Utc).AddSeconds([double]$expiry) }
+            Else { $expiresUtc = ([DateTimeOffset]::Parse([string]$expiry, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime }
+        }
+        Catch { throw 'Token expiry metadata is invalid. Supply ExpiresOn as an ISO 8601 UTC date or Unix seconds.' }
+    }
+    Else
+    {
+        $lifetime = Get-AADRProperty $Token 'expires_in'
+        If ($null -ne $lifetime)
+        {
+            $seconds = 0.0
+            If (-Not [double]::TryParse([string]$lifetime, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -or $seconds -le 0 -or $seconds -gt 31536000)
+            { throw 'Token expires_in metadata is invalid.' }
+            $expiresUtc = [DateTime]::UtcNow.AddSeconds($seconds)
+        }
+    }
+    # Expiry is a scheduling hint from the issuer response, never proof of validity.
+    # Graph tokens can be opaque; do not require or decode JWT claims.
+    [pscustomobject]@{Token=(ConvertTo-AADRGraphAccessToken $Token); ExpiresOnUtc=$expiresUtc}
+}
+
+Function Get-AADRTokenIdentity
+{
+    # Direct calls deliberately avoid the renewal wrapper (and recursion).
+    Try { $org = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id' -OutputType PSObject -ErrorAction Stop }
+    Catch { Stop-AADRTokenVerification -Record $_ -Operation IdentityOrganization }
+    $organizations = @(Get-AADRProperty $org 'value')
+    If ($organizations.Count -ne 1 -or -Not $organizations[0].id) { throw 'Could not verify token tenant.' }
+    Try { $me = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=id' -OutputType PSObject -ErrorAction Stop }
+    Catch { Stop-AADRTokenVerification -Record $_ -Operation IdentityUser }
+    If (-Not $me.id) { throw 'Could not verify the delegated token user.' }
+    [pscustomobject]@{TenantId=[string]$organizations[0].id; UserId=[string]$me.id}
+}
+
+Function Invoke-AADRTokenProvider
+{
+    [CmdletBinding()]
+    param([string] $Reason)
+    $ErrorActionPreference = 'Stop'
+    $session = $script:AADRTokenSession
+    $forceRefresh = $Reason -ne 'Startup' -or ($null -ne $session.ExpiresOnUtc -and $session.ExpiresOnUtc -le [DateTime]::UtcNow.AddSeconds($session.WindowSeconds))
+    $request = [pscustomobject]@{Reason=$Reason; ForceRefresh=$forceRefresh; ExpiresOnUtc=$session.ExpiresOnUtc; TenantId=$session.Identity.TenantId; UserId=$session.Identity.UserId}
+    Try { $responses = @(& $session.Provider $request) }
+    Catch { throw 'Token provider failed. Reauthenticate its source session or renew the Kerberos ticket, then resume the run. Provider exception details are suppressed to protect credentials.' }
+    If ($responses.Count -ne 1 -or $null -eq $responses[0]) { throw 'Token provider must return exactly one token response; write status messages to the verbose/information stream.' }
+    $lease = ConvertTo-AADRTokenLease $responses[0]
+    If ($null -eq $lease.ExpiresOnUtc -and $session.Mode -eq 'Provider')
+    { throw 'AccessTokenProvider must return expiry metadata (ExpiresOn, expires_on, or expires_in) with the token.' }
+    If ($null -ne $lease.ExpiresOnUtc -and $lease.ExpiresOnUtc -le [DateTime]::UtcNow.AddSeconds($session.WindowSeconds))
+    {
+        If ($Reason -eq 'Startup') { return Invoke-AADRTokenProvider -Reason Proactive }
+        $exception = New-Object System.Security.Authentication.AuthenticationException -ArgumentList 'Token provider returned an expired or nearly expired token. It must acquire a fresh token beyond the renewal window.'
+        $record = New-Object System.Management.Automation.ErrorRecord -ArgumentList $exception, 'AADRTokenVerificationFailed', ([System.Management.Automation.ErrorCategory]::AuthenticationError), $null
+        $diagnostic = Get-AADRErrorDiagnostic $record
+        $diagnostic.Category = 'AuthenticationFailed'
+        $diagnostic.Reason = 'ExpiryWithinRenewalWindow'
+        $diagnostic.Operation = 'TokenMetadata'
+        $diagnostic | Add-Member NoteProperty ExpiresOnUtc $lease.ExpiresOnUtc.ToString('o')
+        $diagnostic | Add-Member NoteProperty ClientUtc ([DateTime]::UtcNow.ToString('o'))
+        $diagnostic.Guidance = 'Issuer expiry metadata falls within the renewal window. Check UTC conversion, system time, and the token source. No Graph request was made for this rejected lease.'
+        $exception.Data['AADRSafeDiagnostic'] = $diagnostic
+        Add-AADREvent -Operation TokenMetadata -Status AuthenticationFailed -Detail 'Token expiry metadata was rejected locally before connecting to Graph.' -Diagnostic $diagnostic
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    return $lease
+}
+
+Function Initialize-AADRTokenSession
+{
+    [CmdletBinding()]
+    param($Token, [scriptblock] $Provider, $ExpiresOn, [int] $WindowSeconds = 300, [string] $Mode = 'Provider', [hashtable] $ProviderParameters)
+    $script:AADRTokenSession = [pscustomobject]@{Provider=$Provider; ProviderParameters=$ProviderParameters; Mode=$Mode; ExpiresOnUtc=$null; WindowSeconds=$WindowSeconds; Identity=$null; Busy=$false; Ready=$false; NextRenewalUtc=$null}
+    $session = $script:AADRTokenSession
+    $lease = $null
+    If ($null -ne $Token) { $lease = ConvertTo-AADRTokenLease -Token $Token -ExpiresOn $ExpiresOn; $session.ExpiresOnUtc = $lease.ExpiresOnUtc }
+    If ($null -eq $lease -or ($Provider -and $Mode -eq 'Provider' -and $null -eq $lease.ExpiresOnUtc) -or
+        ($null -ne $lease.ExpiresOnUtc -and $lease.ExpiresOnUtc -le [DateTime]::UtcNow.AddSeconds($WindowSeconds)))
+    {
+        If (-Not $Provider) { throw 'The supplied token is expired or within the renewal window. Provide AccessTokenProvider or acquire a fresh token before starting.' }
+        $lease = Invoke-AADRTokenProvider -Reason Startup
+    }
+    Try { Connect-AADRGraphAccessToken -Token $lease.Token }
+    Catch
+    {
+        If (-Not $Provider -or -Not (Test-AADRGraphAuthenticationError $_)) { throw }
+        # An opaque token can be expired/revoked even when metadata looks current.
+        $lease = Invoke-AADRTokenProvider -Reason Unauthorized
+        Connect-AADRGraphAccessToken -Token $lease.Token
+    }
+    If ($Provider) { $session.Identity = Get-AADRTokenIdentity }
+    $session.ExpiresOnUtc = $lease.ExpiresOnUtc
+    $session.NextRenewalUtc = [DateTime]::UtcNow.AddSeconds($WindowSeconds)
+    $session.Ready = $true
+    If ($null -eq $lease.ExpiresOnUtc)
+    {
+        If ($Provider) { Write-Warning 'Token source returned no expiry metadata. Graph verified the token; Seamless SSO will be reacquired periodically, but renewal before expiry cannot be guaranteed.' }
+        Else { Write-Warning 'Token expiry is unknown. Graph verified it at startup, but proactive renewal requires a provider and expiry metadata. Pass the full token response or AccessTokenExpiresOn.' }
+    }
+    ElseIf (-Not $Provider) { Write-Warning 'No AccessTokenProvider was supplied. Collection will stop before the known token expiry; a token string alone cannot be refreshed.' }
+}
+
+Function Update-AADRTokenSession
+{
+    [CmdletBinding()]
+    param([switch] $Force)
+    $session = $script:AADRTokenSession
+    If ($null -eq $session -or -Not $session.Ready -or $session.Busy) { return }
+    $due = If ($null -ne $session.ExpiresOnUtc) { [DateTime]::UtcNow -ge $session.ExpiresOnUtc.AddSeconds(-$session.WindowSeconds) }
+        Else { $null -ne $session.Provider -and [DateTime]::UtcNow -ge $session.NextRenewalUtc }
+    If (-Not $Force -and -Not $due) { return }
+    $session.Busy = $true
+    Try
+    {
+        If (-Not $session.Provider)
+        { throw 'Token renewal is required, but no AccessTokenProvider is configured. Acquire a fresh token or use SDK-managed authentication. Completed collector checkpoints are retained.' }
+        $reason = If ($Force) { 'Unauthorized' } Else { 'Proactive' }
+        $lease = Invoke-AADRTokenProvider -Reason $reason
+        Connect-AADRGraphAccessToken -Token $lease.Token
+        $identity = Get-AADRTokenIdentity
+        If ($identity.TenantId -ne $session.Identity.TenantId -or $identity.UserId -ne $session.Identity.UserId)
+        { throw 'Renewed token identifies a different tenant or user. Collection stopped to prevent mixing identities.' }
+        $session.ExpiresOnUtc = $lease.ExpiresOnUtc
+        $session.NextRenewalUtc = [DateTime]::UtcNow.AddSeconds($session.WindowSeconds)
+        Add-AADREvent -Operation Authentication -Status TokenRenewed -Detail 'Replacement token accepted by Graph; tenant and delegated user matched.'
+        If ($script:AADRRun -and $script:AADRRun.Status -eq 'Running') { Write-AADRManifest }
+    }
+    Catch
+    {
+        $renewalError = $_
+        $session.Ready = $false
+        Disconnect-AADRGraphSession
+        Add-AADREvent -Operation Authentication -Status AuthenticationFailed -Detail 'Token renewal failed; collection stopped and completed collector checkpoints retained.'
+        $exception = New-Object System.Security.Authentication.AuthenticationException -ArgumentList $renewalError.Exception.Message
+        $diagnostic = Get-AADRErrorDiagnostic $renewalError
+        $diagnostic.Category = 'AuthenticationFailed'
+        $diagnostic.Guidance = 'Reauthenticate the token source and check provider expiry metadata or Kerberos availability before resuming.'
+        $exception.Data['AADRSafeDiagnostic'] = $diagnostic
+        $record = New-Object System.Management.Automation.ErrorRecord -ArgumentList $exception, 'AADRTokenRenewalFailed', ([System.Management.Automation.ErrorCategory]::AuthenticationError), $null
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    Finally { $session.Busy = $false }
+}
+
+Function Connect-AADRGraphAccessToken
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] $Token)
+
+    $secureToken = ConvertTo-AADRGraphAccessToken -Token $Token
+    $operation = 'GraphConnection'
+    Try
+    {
+        Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop | Out-Null
+        # A Graph context alone does not prove that the supplied token is accepted.
+        # Organization access is also required by tenant collection.
+        $operation = 'OrganizationProbe'
+        Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id' -ErrorAction Stop | Out-Null
+    }
+    Catch
+    {
+        $verificationError = $_
+        Disconnect-AADRGraphSession
+        Stop-AADRTokenVerification -Record $verificationError -Operation $operation
+    }
+}
+
+Function Initialize-AADRWindowsKerberosInterop
+{
+    If ('AzureADRecon.Native.KerberosTicketCache' -as [type]) { return }
+
+    # Keep the native API adapter separate so failure and cleanup paths can be tested offline.
+    # ABI: microsoft/win32metadata generation/WinSDK/RecompiledIdlHeaders/um/NTSecAPI.h
+    # Calls: https://learn.microsoft.com/windows/win32/api/ntsecapi/nf-ntsecapi-lsacallauthenticationpackage
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace AzureADRecon.Native
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LsaString
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct Luid { public uint LowPart; public int HighPart; }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct KerbCryptoKey32 { public int KeyType; public uint Length; public uint Offset; }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct KerbSubmitTicketRequest
+    {
+        public int MessageType;
+        public Luid LogonId;
+        public uint Flags;
+        public KerbCryptoKey32 Key;
+        public uint KerbCredSize;
+        public uint KerbCredOffset;
+    }
+
+    public interface ILsaApi
+    {
+        int Connect(out IntPtr handle);
+        int Lookup(IntPtr handle, ref LsaString name, out uint package);
+        int Call(IntPtr handle, uint package, IntPtr request, uint length,
+            out IntPtr response, out uint responseLength, out int protocolStatus);
+        int FreeResponse(IntPtr response);
+        int Close(IntPtr handle);
+        uint ToWinError(int status);
+    }
+
+    internal sealed class WindowsLsaApi : ILsaApi
+    {
+        [DllImport("secur32.dll")] private static extern int LsaConnectUntrusted(out IntPtr handle);
+        [DllImport("secur32.dll")] private static extern int LsaLookupAuthenticationPackage(IntPtr handle, ref LsaString name, out uint package);
+        [DllImport("secur32.dll")] private static extern int LsaCallAuthenticationPackage(IntPtr handle, uint package,
+            IntPtr request, uint length, out IntPtr response, out uint responseLength, out int protocolStatus);
+        [DllImport("secur32.dll")] private static extern int LsaFreeReturnBuffer(IntPtr buffer);
+        [DllImport("secur32.dll")] private static extern int LsaDeregisterLogonProcess(IntPtr handle);
+        [DllImport("advapi32.dll")] private static extern uint LsaNtStatusToWinError(int status);
+        public int Connect(out IntPtr handle) { return LsaConnectUntrusted(out handle); }
+        public int Lookup(IntPtr handle, ref LsaString name, out uint package) { return LsaLookupAuthenticationPackage(handle, ref name, out package); }
+        public int Call(IntPtr handle, uint package, IntPtr request, uint length,
+            out IntPtr response, out uint responseLength, out int protocolStatus)
+        { return LsaCallAuthenticationPackage(handle, package, request, length, out response, out responseLength, out protocolStatus); }
+        public int FreeResponse(IntPtr response) { return LsaFreeReturnBuffer(response); }
+        public int Close(IntPtr handle) { return LsaDeregisterLogonProcess(handle); }
+        public uint ToWinError(int status) { return LsaNtStatusToWinError(status); }
+    }
+
+    public static class KerberosTicketCache
+    {
+        // Only validate the outer DER envelope here; Windows validates ticket contents.
+        public static void Validate(byte[] ticket)
+        {
+            if (ticket == null || ticket.Length < 4 || ticket[0] != 0x76)
+                throw new ArgumentException("Expected a DER-encoded KRB-CRED (.kirbi) ticket.");
+            int offset = 2;
+            long length = ticket[1];
+            if ((length & 0x80) != 0)
             {
-                Write-Verbose "Removed Empty Directory $HTMLPath"
-                Remove-Item $HTMLPath
+                int count = (int)(length & 0x7f);
+                if (count == 0 || count > 4 || ticket.Length < 2 + count)
+                    throw new ArgumentException("Invalid KRB-CRED length.");
+                length = 0;
+                for (int i = 0; i < count; i++) length = (length << 8) | ticket[offset++];
+            }
+            if (length < 2 || length != ticket.Length - offset || ticket[offset] != 0x30)
+                throw new ArgumentException("KRB-CRED is truncated or has an invalid envelope.");
+        }
+
+        public static void Import(byte[] ticket) { Import(ticket, new WindowsLsaApi()); }
+
+        private static void Check(int status, string operation, ILsaApi api)
+        {
+            if (status < 0)
+                throw new Win32Exception(unchecked((int)api.ToWinError(status)),
+                    operation + " failed (NTSTATUS 0x" + unchecked((uint)status).ToString("X8") + ").");
+        }
+
+        public static void Import(byte[] ticket, ILsaApi api)
+        {
+            Validate(ticket);
+            if (api == null) throw new ArgumentNullException("api");
+            IntPtr handle = IntPtr.Zero;
+            IntPtr response = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+            LsaString name = new LsaString();
+            int bufferSize = 0;
+            try
+            {
+                Check(api.Connect(out handle), "LsaConnectUntrusted", api);
+                name.Length = 8;
+                name.MaximumLength = 9;
+                name.Buffer = Marshal.StringToHGlobalAnsi("Kerberos");
+                uint package;
+                Check(api.Lookup(handle, ref name, out package), "LsaLookupAuthenticationPackage", api);
+
+                int headerSize = Marshal.SizeOf(typeof(KerbSubmitTicketRequest));
+                bufferSize = checked(headerSize + ticket.Length);
+                buffer = Marshal.AllocHGlobal(bufferSize);
+                KerbSubmitTicketRequest request = new KerbSubmitTicketRequest();
+                request.MessageType = 21; // KerbSubmitTicketMessage
+                // LogonId zero targets the caller's logon session; no arbitrary LUID support.
+                request.KerbCredOffset = (uint)headerSize;
+                request.KerbCredSize = (uint)ticket.Length;
+                Marshal.StructureToPtr(request, buffer, false);
+                Marshal.Copy(ticket, 0, IntPtr.Add(buffer, headerSize), ticket.Length);
+                uint responseLength;
+                int protocolStatus;
+                Check(api.Call(handle, package, buffer, (uint)bufferSize,
+                    out response, out responseLength, out protocolStatus), "LsaCallAuthenticationPackage", api);
+                Check(protocolStatus, "Kerberos ticket submission", api);
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
+                    Marshal.FreeHGlobal(buffer);
+                }
+                if (response != IntPtr.Zero) api.FreeResponse(response);
+                if (name.Buffer != IntPtr.Zero) Marshal.FreeHGlobal(name.Buffer);
+                if (handle != IntPtr.Zero) api.Close(handle);
             }
         }
     }
-    If (!(Test-Path -Path $AADROutputDir\*))
+}
+'@ -ErrorAction Stop
+}
+
+Function Import-AADRWindowsKerberosTicket
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [byte[]] $TicketBytes)
+
+    If ($env:OS -ne 'Windows_NT')
     {
-        Remove-Item $AADROutputDir
-        Write-Verbose "Removed Empty Directory $AADROutputDir"
+        throw 'KRB-CRED (.kirbi or Base64) import requires Windows. On Linux/macOS, supply a ccache.'
+    }
+    Initialize-AADRWindowsKerberosInterop
+    [AzureADRecon.Native.KerberosTicketCache]::Import($TicketBytes)
+    Write-Host '[Invoke-AzureADRecon] Imported KRB-CRED into the current Windows logon session. The ticket remains in the session cache after this script exits.'
+}
+
+Function Invoke-AADRWindowsSSORequest
+{
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [string] $Endpoint,
+          [Parameter(Mandatory = $true)] [string] $Body)
+
+    $request = [System.Net.HttpWebRequest]::Create($Endpoint)
+    $request.Timeout = 60000
+    $request.ReadWriteTimeout = 60000
+    $request.Method = 'POST'
+    $request.ContentType = 'application/soap+xml; charset=utf-8'
+    $request.UseDefaultCredentials = $true
+    $request.AllowAutoRedirect = $false
+    $request.ConnectionGroupName = [Guid]::NewGuid().ToString('N')
+    $requestStream = $null
+    $response = $null
+    $reader = $null
+    Try
+    {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        $request.ContentLength = $bytes.Length
+        $requestStream = $request.GetRequestStream()
+        $requestStream.Write($bytes, 0, $bytes.Length)
+        $requestStream.Dispose()
+        $requestStream = $null
+        $response = $request.GetResponse()
+        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        $reader.ReadToEnd()
+    }
+    Finally
+    {
+        ForEach ($resource in @($reader, $response, $requestStream))
+        {
+            If ($resource)
+            {
+                Try { $resource.Dispose() }
+                Catch { Add-AADREvent -Operation 'SSO cleanup' -Status CleanupFailed -Detail 'An HTTP resource could not be disposed.' -Diagnostic (Get-AADRErrorDiagnostic $_) }
+            }
+        }
+        Try { $null = $request.ServicePoint.CloseConnectionGroup($request.ConnectionGroupName) }
+        Catch { Add-AADREvent -Operation 'SSO cleanup' -Status CleanupFailed -Detail 'The HTTP connection group could not be closed.' -Diagnostic (Get-AADRErrorDiagnostic $_) }
     }
 }
 
@@ -3458,9 +4872,9 @@ Function Get-AADRSeamlessSSOToken
     Acquires an AccessToken for Microsoft Graph using Azure AD Seamless SSO (Kerberos HTTP/autologon.microsoftazuread-sso.com).
 
 .DESCRIPTION
-    Leverages domain-joined Windows Kerberos ticket authentication or Linux Kerberos tickets (TGT / ccache / kirbi)
+    Leverages domain-joined Windows Kerberos ticket authentication or Kerberos credential caches (ccache)
     against the Azure AD Seamless SSO endpoint (HTTP/autologon.microsoftazuread-sso.com).
-    Supports TGT/kirbi conversion, custom DC and Domain configuration, AADInternals, MSAL.PS, curl --negotiate,
+    Supports Windows KRB-CRED import, existing ccache files, custom DC and Domain configuration, AADInternals, MSAL.PS, curl --negotiate,
     or native WS-Trust / SAML bearer token exchange.
 
 .PARAMETER TenantID
@@ -3473,7 +4887,7 @@ Function Get-AADRSeamlessSSOToken
     Domain Controller IP or hostname.
 
 .PARAMETER TGT
-    Path to Kerberos ticket (.ccache or .kirbi).
+    Kerberos ticket file or Base64 contents. Windows imports KRB-CRED (.kirbi) into the current logon session; Linux/macOS uses ccache.
 #>
     param(
         [Parameter(Mandatory = $false)]
@@ -3486,103 +4900,82 @@ Function Get-AADRSeamlessSSOToken
         [string] $DC,
 
         [Parameter(Mandatory = $false)]
-        [string] $TGT
+        [string] $TGT,
+
+        [switch] $IncludeMetadata,
+
+        [switch] $ForceRefresh
     )
 
-    Write-Output "[Invoke-AzureADRecon] Attempting Seamless SSO (Kerberos HTTP/autologon.microsoftazuread-sso.com)..."
+    Write-Host "[Invoke-AzureADRecon] Attempting Seamless SSO (Kerberos HTTP/autologon.microsoftazuread-sso.com)..."
 
+    $useWindowsTicket = $false
+    $previousKrb5CCName = $env:KRB5CCNAME
+    $previousKrb5Config = $env:KRB5_CONFIG
     $tempFilesToClean = [System.Collections.Generic.List[string]]::new()
 
     Try
     {
-        # --- Handle Ticket / TGT on Linux/Windows ---
+        # Import KRB-CRED on Windows or use an existing ccache without conversion.
         If (-Not [string]::IsNullOrEmpty($TGT))
         {
-            $resolvedTGT = $TGT
-            $isBase64Ticket = $false
+            $resolvedTGT = $null
             $ticketBytes = $null
-
-            If (Test-Path $TGT)
+            Try
             {
-                $resolvedTGT = (Resolve-Path $TGT).Path
-            }
-            Else
-            {
-                # Try decoding as Base64 (e.g. Rubeus /nowrap base64 ticket)
-                $trimmedTGT = $TGT.Trim() -replace '\s+', ''
-                Try
+                If (Test-Path -LiteralPath $TGT -PathType Leaf -ErrorAction SilentlyContinue)
                 {
-                    $ticketBytes = [System.Convert]::FromBase64String($trimmedTGT)
-                    If ($ticketBytes -and $ticketBytes.Length -gt 16)
-                    {
-                        $isBase64Ticket = $true
-                    }
+                    $resolvedTGT = (Resolve-Path -LiteralPath $TGT).Path
+                    $ticketBytes = [System.IO.File]::ReadAllBytes($resolvedTGT)
                 }
-                Catch {}
-
-                If ($isBase64Ticket)
-                {
-                    Write-Output "[Invoke-AzureADRecon] Detected Base64-encoded Kerberos ticket."
-                    # Determine extension: 0x76 (ASN.1 tag 22) is KRB-CRED (.kirbi), else .ccache
-                    $ext = If ($ticketBytes[0] -eq 0x76) { ".kirbi" } Else { ".ccache" }
-                    $tempTicketPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "ticket_$([System.Guid]::NewGuid().ToString('N'))$ext")
-                    [System.IO.File]::WriteAllBytes($tempTicketPath, $ticketBytes)
-                    $tempFilesToClean.Add($tempTicketPath)
-                    $resolvedTGT = $tempTicketPath
-                }
-            }
-
-            If (Test-Path $resolvedTGT)
-            {
-                # Check if it is a .kirbi ticket (Windows KRB-CRED format)
-                $isKirbi = $resolvedTGT.ToLower().EndsWith(".kirbi")
-                If (-Not $isKirbi)
+                Else
                 {
                     Try
                     {
-                        $firstByte = [System.IO.File]::ReadAllBytes($resolvedTGT)[0]
-                        If ($firstByte -eq 0x76) { $isKirbi = $true }
+                        $ticketBytes = [System.Convert]::FromBase64String(($TGT.Trim() -replace '\s+', ''))
                     }
-                    Catch {}
-                }
-
-                If ($isKirbi)
-                {
-                    Write-Output "[Invoke-AzureADRecon] Detected .kirbi Kerberos ticket."
-                    # If running on Linux/macOS or using GSSAPI, convert .kirbi to .ccache
-                    If ($PSVersionTable.Platform -ne "Win32NT")
+                    Catch
                     {
-                        $ccachePath = [System.IO.Path]::ChangeExtension($resolvedTGT, ".ccache")
-                        $tempFilesToClean.Add($ccachePath)
-                        $converter = Get-Command "impacket-ticketConverter", "ticketConverter.py" -ErrorAction SilentlyContinue | Select-Object -First 1
-                        If ($converter)
-                        {
-                            Write-Output "[Invoke-AzureADRecon] Converting Kirbi to ccache using $($converter.Name)..."
-                            & $converter.Name $resolvedTGT $ccachePath | Out-Null
-                            If (Test-Path $ccachePath)
-                            {
-                                $resolvedTGT = $ccachePath
-                            }
-                        }
-                        Else
-                        {
-                            Write-Warning "[Invoke-AzureADRecon] .kirbi format detected on Linux but 'impacket-ticketConverter' was not found in PATH."
-                            Write-Warning "[Invoke-AzureADRecon] If GSSAPI fails, convert it with: impacket-ticketConverter $resolvedTGT $ccachePath"
-                        }
+                        throw 'TGT must be an existing ticket file or Base64-encoded ticket contents.'
                     }
                 }
 
-                $env:KRB5CCNAME = $resolvedTGT
-                Write-Output "[Invoke-AzureADRecon] Set KRB5CCNAME to $resolvedTGT"
+                If (($resolvedTGT -and $resolvedTGT.EndsWith('.kirbi', [System.StringComparison]::OrdinalIgnoreCase)) -or
+                    ($ticketBytes.Length -gt 0 -and $ticketBytes[0] -eq 0x76))
+                {
+                    Import-AADRWindowsKerberosTicket -TicketBytes $ticketBytes
+                    $useWindowsTicket = $true
+                    # Force SSPI to use the Windows session rather than an inherited ccache.
+                    $env:KRB5CCNAME = $null
+                }
+                Else
+                {
+                    If ($env:OS -eq 'Windows_NT')
+                    {
+                        throw 'ccache input requires Linux/macOS. On Windows, supply a KRB-CRED (.kirbi) file or Base64 KRB-CRED ticket.'
+                    }
+                    If ($ticketBytes.Length -lt 2 -or $ticketBytes[0] -ne 0x05 -or $ticketBytes[1] -notin @(1, 2, 3, 4))
+                    {
+                        throw 'TGT is neither a KRB-CRED ticket nor a supported ccache (invalid format header).'
+                    }
+                    If (-Not $resolvedTGT)
+                    {
+                        $resolvedTGT = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "ticket_$([System.Guid]::NewGuid().ToString('N')).ccache")
+                        $tempFilesToClean.Add($resolvedTGT)
+                        [System.IO.File]::WriteAllBytes($resolvedTGT, $ticketBytes)
+                    }
+                    $env:KRB5CCNAME = $resolvedTGT
+                    Write-Host "[Invoke-AzureADRecon] Set KRB5CCNAME to $resolvedTGT"
+                }
             }
-            Else
+            Finally
             {
-                Write-Warning "[Invoke-AzureADRecon] Specified TGT was not found as a valid file path or Base64 string."
+                If ($ticketBytes) { [Array]::Clear($ticketBytes, 0, $ticketBytes.Length) }
             }
         }
 
         # --- Handle Domain and DC configuration on Linux ---
-        If (-Not [string]::IsNullOrEmpty($Domain) -and -Not [string]::IsNullOrEmpty($DC))
+        If ($env:OS -ne "Windows_NT" -and -Not [string]::IsNullOrEmpty($Domain) -and -Not [string]::IsNullOrEmpty($DC))
         {
             $realmUpper = $Domain.ToUpper()
             $tempKrb5 = [System.IO.Path]::GetTempFileName()
@@ -3601,11 +4994,11 @@ Function Get-AADRSeamlessSSOToken
 "@
             [System.IO.File]::WriteAllText($tempKrb5, $krb5ConfigContent)
             $env:KRB5_CONFIG = $tempKrb5
-            Write-Output "[Invoke-AzureADRecon] Configured Kerberos realm $realmUpper with KDC $DC"
+            Write-Host "[Invoke-AzureADRecon] Configured Kerberos realm $realmUpper with KDC $DC"
         }
 
         # Strategy 1: AADInternals module if available
-        If (Get-Module -ListAvailable -Name AADInternals)
+        If (-Not $ForceRefresh -and [string]::IsNullOrEmpty($TGT) -and (Get-Module -ListAvailable -Name AADInternals))
         {
             Try
             {
@@ -3614,25 +5007,22 @@ Function Get-AADRSeamlessSSOToken
                 $tokenParam = @{}
                 If (-Not [string]::IsNullOrEmpty($TenantID)) { $tokenParam['Tenant'] = $TenantID }
                 If (-Not [string]::IsNullOrEmpty($Domain)) { $tokenParam['Domain'] = $Domain }
-                If (-Not [string]::IsNullOrEmpty($resolvedTGT) -and (Test-Path $resolvedTGT))
-                {
-                    $tokenParam['KerberosTicket'] = [System.IO.File]::ReadAllBytes($resolvedTGT)
-                }
                 $tokenObj = Get-AADIntAccessTokenForMSGraph @tokenParam -ErrorAction Stop
                 If ($tokenObj)
                 {
+                    If ($IncludeMetadata) { return $tokenObj }
                     If ($tokenObj -is [string]) { return $tokenObj }
                     If ($tokenObj.access_token) { return $tokenObj.access_token }
                 }
             }
             Catch
             {
-                Write-Verbose "[Invoke-AzureADRecon] AADInternals token acquisition failed: $($_.Exception.Message)"
+                Write-Verbose "[Invoke-AzureADRecon] AADInternals token acquisition failed: operation unavailable"
             }
         }
 
         # Strategy 2: MSAL.PS module if available
-        If (Get-Module -ListAvailable -Name MSAL.PS)
+        If (-Not $ForceRefresh -and [string]::IsNullOrEmpty($TGT) -and (Get-Module -ListAvailable -Name MSAL.PS))
         {
             Try
             {
@@ -3647,31 +5037,32 @@ Function Get-AADRSeamlessSSOToken
                 $msalRes = Get-MsalToken @msalParams -ErrorAction Stop
                 If ($msalRes.AccessToken)
                 {
+                    If ($IncludeMetadata) { return $msalRes }
                     return $msalRes.AccessToken
                 }
             }
             Catch
             {
-                Write-Verbose "[Invoke-AzureADRecon] MSAL.PS IWA acquisition failed: $($_.Exception.Message)"
+                Write-Verbose "[Invoke-AzureADRecon] MSAL.PS IWA acquisition failed: operation unavailable"
             }
         }
 
-        # Strategy 3: Az.Accounts if session already exists
-        If (Get-Module -ListAvailable -Name Az.Accounts)
+        # Strategy 3: Az.Accounts (ONLY if already loaded in session to prevent assembly version conflict with Microsoft.Graph)
+        If (-Not $ForceRefresh -and [string]::IsNullOrEmpty($TGT) -and (Get-Module -Name Az.Accounts))
         {
             Try
             {
-                Write-Verbose "[Invoke-AzureADRecon] Checking Az.Accounts for MSGraph access token..."
-                Import-Module Az.Accounts -ErrorAction Stop
+                Write-Verbose "[Invoke-AzureADRecon] Checking active Az session for MSGraph access token..."
                 $azToken = Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop
                 If ($azToken.Token)
                 {
+                    If ($IncludeMetadata) { return $azToken }
                     return $azToken.Token
                 }
             }
             Catch
             {
-                Write-Verbose "[Invoke-AzureADRecon] Az.Accounts token acquisition failed: $($_.Exception.Message)"
+                Write-Verbose "[Invoke-AzureADRecon] Az.Accounts token acquisition failed: operation unavailable"
             }
         }
 
@@ -3703,8 +5094,8 @@ Function Get-AADRSeamlessSSOToken
         $responseXml = $null
 
         # If on Linux or non-Windows, or curl is available and KRB5CCNAME is set, use curl with --negotiate
-        $curlCmd = Get-Command "curl" -ErrorAction SilentlyContinue
-        If ($curlCmd -and ($PSVersionTable.Platform -ne "Win32NT" -or -Not [string]::IsNullOrEmpty($env:KRB5CCNAME)))
+        $curlCmd = Get-Command "curl" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        If (-Not $useWindowsTicket -and $curlCmd -and ($env:OS -ne "Windows_NT" -or -Not [string]::IsNullOrEmpty($env:KRB5CCNAME)))
         {
             Try
             {
@@ -3713,15 +5104,15 @@ Function Get-AADRSeamlessSSOToken
                 $tempFilesToClean.Add($tempReq)
                 [System.IO.File]::WriteAllText($tempReq, $rstXml)
 
-                $curlOutput = & curl -s --negotiate -u : -X POST "$endpoint" -H "Content-Type: application/soap+xml; charset=utf-8" --data-binary "@$tempReq"
-                If (-Not [string]::IsNullOrEmpty($curlOutput) -and $curlOutput.Contains("Assertion"))
+                $curlOutput = (& $curlCmd.Source -s --connect-timeout 15 --max-time 60 --negotiate -u : -X POST "$endpoint" -H "Content-Type: application/soap+xml; charset=utf-8" --data-binary "@$tempReq") -join "`n"
+                If ($LASTEXITCODE -eq 0 -and -Not [string]::IsNullOrEmpty($curlOutput) -and $curlOutput.Contains("Assertion"))
                 {
                     $responseXml = $curlOutput
                 }
             }
             Catch
             {
-                Write-Verbose "[Invoke-AzureADRecon] curl --negotiate exchange error: $($_.Exception.Message)"
+                Write-Verbose "[Invoke-AzureADRecon] curl --negotiate exchange error: operation unavailable"
             }
         }
 
@@ -3731,26 +5122,11 @@ Function Get-AADRSeamlessSSOToken
             Try
             {
                 Write-Verbose "[Invoke-AzureADRecon] Performing .NET HttpWebRequest Kerberos exchange..."
-                $request = [System.Net.HttpWebRequest]::Create($endpoint)
-                $request.Method = "POST"
-                $request.ContentType = "application/soap+xml; charset=utf-8"
-                $request.UseDefaultCredentials = $true
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($rstXml)
-                $request.ContentLength = $bytes.Length
-
-                $requestStream = $request.GetRequestStream()
-                $requestStream.Write($bytes, 0, $bytes.Length)
-                $requestStream.Close()
-
-                $response = $request.GetResponse()
-                $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
-                $responseXml = $reader.ReadToEnd()
-                $reader.Close()
-                $response.Close()
+                $responseXml = Invoke-AADRWindowsSSORequest -Endpoint $endpoint -Body $rstXml
             }
             Catch
             {
-                Write-Verbose "[Invoke-AzureADRecon] .NET HttpWebRequest exchange error: $($_.Exception.Message)"
+                Write-Verbose "[Invoke-AzureADRecon] .NET HttpWebRequest exchange error: operation unavailable"
             }
         }
 
@@ -3761,27 +5137,66 @@ Function Get-AADRSeamlessSSOToken
             $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
             $nsMgr.AddNamespace("saml", "urn:oasis:names:tc:SAML:1.0:assertion")
             $assertionNode = $xmlDoc.SelectSingleNode("//saml:Assertion", $nsMgr)
+            If (-Not $assertionNode)
+            {
+                # Try finding any assertion node regardless of namespace prefix
+                $assertionNode = $xmlDoc.SelectSingleNode("//*[local-name()='Assertion']")
+            }
 
             If ($assertionNode)
             {
-                $assertionBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($assertionNode.OuterXml))
-                $tokenBody = @{
-                    grant_type = "urn:ietf:params:oauth:grant-type:saml1_1-bearer"
-                    assertion  = $assertionBase64
-                    resource   = "https://graph.microsoft.com"
-                    client_id  = "14d82eec-204b-4c2f-b7e8-296a70dab67e" # Microsoft Graph PowerShell
-                }
-                $tokenRes = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$realm/oauth2/token" -Method POST -Body $tokenBody -ErrorAction Stop
-                If ($tokenRes.access_token)
+                $assertionXml = $assertionNode.OuterXml
+                $assertionBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($assertionXml))
+
+                # Primary attempt: OAuth v1.0 token endpoint with resource
+                Try
                 {
-                    Write-Output "[Invoke-AzureADRecon] Successfully acquired token via Seamless SSO Kerberos exchange."
-                    return $tokenRes.access_token
+                    $tokenBody = @{
+                        grant_type = "urn:ietf:params:oauth:grant-type:saml1_1-bearer"
+                        assertion  = $assertionBase64
+                        resource   = "https://graph.microsoft.com"
+                        client_id  = "14d82eec-204b-4c2f-b7e8-296a70dab67e" # Microsoft Graph PowerShell
+                    }
+                    $tokenRes = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$realm/oauth2/token" -Method POST -Body $tokenBody -ErrorAction Stop
+                    If ($tokenRes.access_token)
+                    {
+                        Write-Host "[Invoke-AzureADRecon] Successfully acquired token via Seamless SSO Kerberos exchange."
+                        If ($IncludeMetadata) { return $tokenRes }
+                        return ([string]$tokenRes.access_token).Trim()
+                    }
+                }
+                Catch
+                {
+                    Write-Verbose "[Invoke-AzureADRecon] OAuth v1 token exchange failed (operation unavailable), attempting v2.0 endpoint..."
+                    # Secondary attempt: OAuth v2.0 token endpoint with scope
+                    Try
+                    {
+                        $tokenBodyV2 = @{
+                            grant_type = "urn:ietf:params:oauth:grant-type:saml1_1-bearer"
+                            assertion  = $assertionBase64
+                            scope      = "https://graph.microsoft.com/.default openid profile offline_access"
+                            client_id  = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+                        }
+                        $tokenResV2 = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$realm/oauth2/v2.0/token" -Method POST -Body $tokenBodyV2 -ErrorAction Stop
+                        If ($tokenResV2.access_token)
+                        {
+                            Write-Host "[Invoke-AzureADRecon] Successfully acquired token via Seamless SSO Kerberos exchange (v2.0)."
+                            If ($IncludeMetadata) { return $tokenResV2 }
+                            return ([string]$tokenResV2.access_token).Trim()
+                        }
+                    }
+                    Catch
+                    {
+                        Write-Verbose "[Invoke-AzureADRecon] OAuth v2.0 token exchange also failed: operation unavailable"
+                    }
                 }
             }
         }
     }
     Finally
     {
+        $env:KRB5CCNAME = $previousKrb5CCName
+        $env:KRB5_CONFIG = $previousKrb5Config
         ForEach ($f in $tempFilesToClean)
         {
             If (Test-Path $f) { Remove-Item -Path $f -Force -ErrorAction SilentlyContinue }
@@ -3854,34 +5269,9 @@ Function Get-AADRAbout
 
     $Version = $Method
 
-    If ($Credential -ne [Management.Automation.PSCredential]::Empty)
-    {
-        $Username = $($Credential.UserName)
-    }
-    ElseIf ($Method -eq "MSGraph")
-    {
-        $mgContext = Get-MgContext -ErrorAction SilentlyContinue
-        If ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.Account)))
-        {
-            $Username = $mgContext.Account
-        }
-        ElseIf ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.AppName)))
-        {
-            $Username = $mgContext.AppName
-        }
-        ElseIf ($mgContext -and (-Not [string]::IsNullOrEmpty($mgContext.ClientId)))
-        {
-            $Username = $mgContext.ClientId
-        }
-        Else
-        {
-            $Username = $([Environment]::UserName)
-        }
-    }
-    Else
-    {
-        $Username = $([Environment]::UserName)
-    }
+    $mgContext = Get-MgContext -ErrorAction SilentlyContinue
+    $Username = If ($mgContext.Account) { $mgContext.Account } ElseIf ($mgContext.AppName) { $mgContext.AppName }
+        ElseIf ($mgContext.ClientId) { $mgContext.ClientId } Else { 'Unknown (Graph context did not identify the caller)' }
 
     $ObjValues = @("Date", $($date), "AzureADRecon", "https://github.com/adrecon/AzureADRecon", $Version, $($AzureADReconVersion), "Ran as user", $Username, "Ran on computer", $RanonComputer, "Execution Time (mins)", $($TotalTime))
 
@@ -3898,764 +5288,268 @@ Function Get-AADRAbout
 
 Function Invoke-AzureADRecon
 {
-<#
-.SYNOPSIS
-    Wrapper function to run AzureADRecon modules.
-
-.DESCRIPTION
-    Wrapper function to set variables, check dependencies and run AzureADRecon modules.
-
-.PARAMETER Method
-    [string]
-    Which method to use; MSGraph.
-
-.PARAMETER Collect
-    [array]
-    Which modules to run; Tenant, Domain, DirectoryRoles, Users, Groups.
-
-.PARAMETER Credential
-    [Management.Automation.PSCredential]
-    Credentials.
-
-.PARAMETER OutputDir
-    [string]
-	Path for AzureADRecon output folder to save the CSV files and the AzureADRecon-Report.xlsx.
-
-.PARAMETER DormantTimeSpan
-    [int]
-    Timespan for Dormant accounts. Default 30 days.
-
-.PARAMETER PassMaxAge
-    [int]
-    Timespan for Password age. Default 90 days
-
-.PARAMETER PageSize
-    [int]
-    The PageSize to set for the MSGraph query. Default 200.
-
-.PARAMETER Threads
-    [int]
-    The number of threads to use during processing of objects. Default 10.
-
-.PARAMETER Logo
-    [string]
-    Which Logo to use in the excel file? AzureADRecon (default), Payatu.
-
-.OUTPUTS
-    STDOUT, CSV, XML, JSON, HTML and/or Excel file is created in the folder specified with the information.
-#>
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $false)]
         [string] $GenExcel,
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('MSGraph')]
-        [string] $Method = 'MSGraph',
-
-        [Parameter(Mandatory = $true)]
-        [array] $Collect,
-
-        [Parameter(Mandatory = $false)]
-        [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty,
-
-        [Parameter(Mandatory = $false)]
-        $AccessToken,
-
-        [Parameter(Mandatory = $false)]
-        [switch] $SeamlessSSO,
-
-        [Parameter(Mandatory = $false)]
-        [string] $TenantID,
-
-        [Parameter(Mandatory = $false)]
-        [string] $Domain,
-
-        [Parameter(Mandatory = $false)]
-        [string] $DC,
-
-        [Parameter(Mandatory = $false)]
-        [string] $TGT,
-
-        [Parameter(Mandatory = $true)]
-        [array] $OutputType,
-
-        [Parameter(Mandatory = $false)]
-        [string] $AADROutputDir,
-
-        [Parameter(Mandatory = $false)]
-        [int] $DormantTimeSpan = 30,
-
-        [Parameter(Mandatory = $false)]
-        [int] $PassMaxAge = 90,
-
-        [Parameter(Mandatory = $false)]
-        [int] $PageSize = 200,
-
-        [Parameter(Mandatory = $false)]
-        [int] $Threads = 10,
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('AzureADRecon', 'Payatu')]
-        [string] $Logo = "AzureADRecon"
+        [ValidateSet('MSGraph')] [string] $Method = 'MSGraph',
+        [array] $Collect = @('Default'),
+        [System.Management.Automation.PSCredential] $Credential = [System.Management.Automation.PSCredential]::Empty,
+        $AccessToken, [scriptblock] $AccessTokenProvider, $AccessTokenExpiresOn,
+        [ValidateRange(60,900)] [int] $TokenRefreshWindowSeconds = 300,
+        [switch] $SeamlessSSO, [string] $TenantID, [string] $ClientID,
+        [string] $Domain, [string] $DC, [string] $TGT,
+        [array] $OutputType = @('Default'), [string] $AADROutputDir,
+        [int] $DormantTimeSpan = 30, [int] $PassMaxAge = 90, [ValidateRange(1,999)] [int] $PageSize = 200, [ValidateRange(1,100)] [int] $Threads = 10,
+        [string] $Logo = 'AzureADRecon', [switch] $Resume
     )
 
-    [string] $AzureADReconVersion = "v0.03"
-    Write-Output "[*] AzureADRecon $AzureADReconVersion by Prashant Mahajan (@prashant3535)"
-
-    If ($PSVersionTable.PSEdition -eq "Core")
+    $ErrorActionPreference = 'Stop'
+    $returndir = Get-Location
+    $connectionAttempted = $false
+    $manifestWritable = $false
+    $script:AADRRun = $null
+    $script:AADRLastFailure = $null
+    $script:AADRCleanupFailed = $false
+    $script:AADRManifestFailureRecorded = $false
+    $script:AADRManifestWritable = $false
+    $script:AADRExcelFailed = $false
+    $script:AADRTokenSession = $null
+    $script:AADRCurrentCollector = $null
+    $script:AADRPreviousCollectors = @()
+    $script:AADRMFARegistrationLoaded = $false
+    $script:AADRMFARegistrationRows = @()
+    $ssoParameters = $null
+    $stage = 'Output setup'
+    Try
     {
-        If ($PSVersionTable.Platform -ne "Win32NT")
-        {
-            $Method = "MSGraph"
+        If ($GenExcel) { $stage='Excel generation'; Export-ADRExcel -ExcelPath $GenExcel -Logo $Logo; return }
+        If ($Resume -and -Not $AADROutputDir) { throw '-Resume requires -OutputDir pointing to a previous run.' }
+        $formats = @($OutputType | ForEach-Object { $_.ToUpperInvariant() })
+        If ($formats -contains 'ALL') { $formats = @('CSV','XML','JSON','HTML','EXCEL') }
+        If ($formats -contains 'DEFAULT') { $formats = @('CSV','EXCEL') }
+        If ($formats -contains 'EXCEL' -and $formats -notcontains 'CSV') { $formats += 'CSV' }
+        $formats = @($formats | Select-Object -Unique)
+        If (-Not $AADROutputDir) { $AADROutputDir = Join-Path $returndir ('AzureADRecon-Report-' + (Get-Date -Format 'yyyyMMddHHmmssfff')) }
+        $null = New-Item -ItemType Directory -Path $AADROutputDir -Force -ErrorAction Stop
+        $AADROutputDir = (Resolve-Path -LiteralPath $AADROutputDir).Path
+        ForEach ($format in $formats | Where-Object { $_ -in @('CSV','XML','JSON','HTML') })
+        { $null = New-Item -ItemType Directory -Path (Join-Path $AADROutputDir ($format + '-Files')) -Force -ErrorAction Stop }
+
+        $stage = 'Collection configuration'
+        $registry = Get-AADRCollectionRegistry
+        $selected = If ($Collect -contains 'Default') { @($registry.Keys) } Else { @($Collect | Select-Object -Unique) }
+        ForEach ($name in $selected) { If (-Not $registry.Contains($name)) { throw "Unknown collector: $name" } }
+        $selected = @($selected | ForEach-Object { $requested = $_; $registry.Keys | Where-Object { $_ -ieq $requested } | Select-Object -First 1 })
+        $schemaVersion = 2
+        $script:AADRRun = [pscustomobject][ordered]@{
+            SchemaVersion=$schemaVersion; RunId=[guid]::NewGuid().ToString(); StartedUtc=[DateTime]::UtcNow.ToString('o'); FinishedUtc=$null
+            Status='Starting'; TenantId=$null; Account=$null; ClientId=$null; AuthType=$null; ContextScopes=@()
+            OutputDirectory=$AADROutputDir; OutputFormats=$formats; SelectedCollectors=$selected; Settings=@{DormantTimeSpan=$DormantTimeSpan; PassMaxAge=$PassMaxAge; PageSize=$PageSize}
+            ScriptHash=(Get-FileHash -LiteralPath $script:AADRScriptPath -Algorithm SHA256).Hash
+            SnapshotUtc=[DateTime]::UtcNow.ToString('o'); Collectors=(New-Object System.Collections.Generic.List[object]); Events=(New-Object System.Collections.Generic.List[object])
         }
-    }
+        $priorManifestPath = Join-Path $AADROutputDir 'CollectionManifest.json'
+        $prior = If ($Resume -and (Test-Path -LiteralPath $priorManifestPath)) { Get-Content -LiteralPath $priorManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } Else { $null }
+        If ($Resume -and -Not $prior) { throw 'Resume manifest was not found.' }
+        If (-Not $Resume -and (Test-Path -LiteralPath $priorManifestPath))
+        { throw 'This output directory already contains a run. Use -Resume or choose a new output directory.' }
 
-    If ($GenExcel)
-    {
-        If (!(Test-Path $GenExcel))
+        # Preserve previous run history before writing the new manifest, even if this run fails.
+        If (Test-Path -LiteralPath $priorManifestPath)
         {
-            Write-Output "[Invoke-AzureADRecon] Invalid Path ... Exiting"
-            Return $null
+            $history = Join-Path $AADROutputDir '.manifests'
+            $null = New-Item -ItemType Directory -Path $history -Force
+            Copy-Item -LiteralPath $priorManifestPath -Destination (Join-Path $history ($script:AADRRun.RunId + '.json')) -ErrorAction Stop
         }
-        Export-ADRExcel -ExcelPath $GenExcel -Logo $Logo
-        Return $null
-    }
-
-    # Import MSGraph module
-    If ($Method -eq 'MSGraph')
-    {
-        If (Get-Module -ListAvailable -Name Microsoft.Graph)
+        # A failed resume authentication/identity check must leave the last usable manifest intact.
+        $manifestWritable = -Not $Resume
+        $script:AADRManifestWritable = $manifestWritable
+        If ($manifestWritable) { Write-AADRManifest -Required }
+        $config = @{}
+        $configPath = Join-Path (Split-Path -Parent $script:AADRScriptPath) 'MSGraph-Credentials.csv'
+        If (Test-Path -LiteralPath $configPath)
         {
-            Try
-            {
-                # Suppress verbose output on module import
-                $SaveVerbosePreference = $script:VerbosePreference;
-                $script:VerbosePreference = 'SilentlyContinue';
-                #Import-Module Microsoft.Graph -WarningAction Stop -ErrorAction Stop | Out-Null
-                #Select-MgProfile -Name Beta
-                If ($SaveVerbosePreference)
-                {
-                    $script:VerbosePreference = $SaveVerbosePreference
-                    Remove-Variable SaveVerbosePreference
-                }
+            ForEach ($row in Import-Csv -LiteralPath $configPath -ErrorAction Stop)
+            { If (-Not [string]::IsNullOrWhiteSpace($row.Value)) { $config[$row.Category] = $row.Value } }
+        }
+        ForEach ($key in @('TenantID','ClientID','Domain','DC','TGT'))
+        {
+            $explicit = Get-Variable -Name $key -ValueOnly
+            If ($explicit) { $config[$key] = $explicit }
+        }
+        If (-Not $AccessToken -and $config.AccessToken) { $AccessToken = $config.AccessToken }
+        If (-Not $SeamlessSSO -and $config.SeamlessSSO -in @('true','1')) { $SeamlessSSO = $true }
+        $stage = 'Authentication'
+        If (-Not (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)) { throw 'Install Microsoft.Graph before running AzureADRecon.' }
+        $script:AADRParserType = Initialize-AADRParserType -Source $MSGraphSource
+        $connectionAttempted = $true
+        If ($SeamlessSSO)
+        {
+            If ($AccessToken) { throw 'Choose either AccessToken or SeamlessSSO.' }
+            If ($AccessTokenProvider) { throw 'Choose either AccessTokenProvider or SeamlessSSO (which supplies its own provider).' }
+            $ssoParameters = @{TenantID=$config.TenantID; Domain=$config.Domain; DC=$config.DC; TGT=$config.TGT; IncludeMetadata=$true}
+            $AccessTokenProvider = {
+                param($request)
+                $parameters = $script:AADRTokenSession.ProviderParameters
+                Get-AADRSeamlessSSOToken @parameters -ForceRefresh:$request.ForceRefresh
             }
-            Catch
-            {
-                Write-Warning "[Invoke-AzureADRecon] Error importing Microsoft.Graph Module. Exiting"
-                If ($SaveVerbosePreference)
-                {
-                    $script:VerbosePreference = $SaveVerbosePreference
-                    Remove-Variable SaveVerbosePreference
-                }
-                Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
-                Return $null
-            }
+        }
+        If ($AccessToken -or $AccessTokenProvider)
+        {
+            $mode = If ($SeamlessSSO) { 'SeamlessSSO' } Else { 'Provider' }
+            Initialize-AADRTokenSession -Token $AccessToken -Provider $AccessTokenProvider -ExpiresOn $AccessTokenExpiresOn -WindowSeconds $TokenRefreshWindowSeconds -Mode $mode -ProviderParameters $ssoParameters
         }
         Else
         {
-            Write-Warning "[Invoke-AzureADRecon] Microsoft.Graph Module is not installed. Run `Install-Module -Name Microsoft.Graph` to continue"
-            Return $null
+            $scopes = @('AuditLog.Read.All','User.Read.All','UserAuthenticationMethod.Read.All','Policy.Read.All','Directory.Read.All')
+            If ($selected -contains 'PIMEligibility') { $scopes += 'RoleEligibilitySchedule.Read.Directory' }
+            $parameters = Get-AADRGraphConnectionParameters -Config $config -Credential $Credential -Scopes $scopes
+            Connect-MgGraph @parameters | Out-Null
         }
-    }
-
-    If ($PSVersionTable.Platform -ne "Win32NT")
-    {
-        $RanonComputer = "$([Environment]::MachineName)"
-    }
-    Else
-    {
-        # Suppress verbose output
-        $SaveVerbosePreference = $script:VerbosePreference
-        $script:VerbosePreference = 'SilentlyContinue'
-        Try
+        # Bind every run/checkpoint to the actual tenant returned by Graph, not a CLI alias.
+        $organization = @(Get-AADRGraphPages 'organization?$select=id')
+        If ($organization.Count -ne 1 -or -Not $organization[0].id) { throw 'Could not verify the authenticated tenant.' }
+        $context = Get-MgContext -ErrorAction Stop
+        $script:AADRRun.TenantId = [string]$organization[0].id
+        $accountIdentity = $context.Account
+        If (-Not $accountIdentity -and $script:AADRTokenSession -and $script:AADRTokenSession.Identity) { $accountIdentity = $script:AADRTokenSession.Identity.UserId }
+        $script:AADRRun.Account = $accountIdentity
+        $script:AADRRun.ClientId = $context.ClientId
+        $script:AADRRun.AuthType = $context.AuthType
+        $script:AADRRun.ContextScopes = @($context.Scopes | Where-Object { $null -ne $_ })
+        $requestedTenantGuid = [guid]::Empty
+        If ($config.TenantID -and [guid]::TryParse($config.TenantID, [ref]$requestedTenantGuid) -and [string]$requestedTenantGuid -ne $script:AADRRun.TenantId)
+        { throw 'The authenticated token belongs to a different tenant than the requested TenantID.' }
+        If ($Resume)
         {
-            If ($PSVersionTable.PSVersion.Major -ne 2)
-            {
-                $computer = Get-CimInstance -ClassName Win32_ComputerSystem
-                $computerdomainrole = ($computer).DomainRole
-            }
-            Else
-            {
-                $computer = Get-WMIObject win32_computersystem
-                $computerdomainrole = ($computer).DomainRole
-            }
+            $stage = 'Resume validation'
+            If (-Not $accountIdentity -and -Not $context.ClientId) { throw 'Resume requires a verified account or application. Use a delegated token provider, interactive authentication, or application credentials.' }
+            $selectionChanged = (@($prior.SelectedCollectors | Sort-Object -Unique) -join ',') -ne (@($selected | Sort-Object -Unique) -join ',')
+            If ($selectionChanged -or $prior.SchemaVersion -ne $schemaVersion -or $prior.TenantId -ne $script:AADRRun.TenantId -or
+                $prior.ScriptHash -ne $script:AADRRun.ScriptHash -or $prior.ClientId -ne $context.ClientId -or $prior.Account -ne $accountIdentity -or
+                $prior.Settings.DormantTimeSpan -ne $DormantTimeSpan -or $prior.Settings.PassMaxAge -ne $PassMaxAge -or $prior.Settings.PageSize -ne $PageSize)
+            { throw 'Resume identity, script version, or collection settings differ from the saved run. Start a new output directory.' }
+            $script:AADRPreviousCollectors = @($prior.Collectors)
+            $script:AADRRun.SnapshotUtc = $prior.SnapshotUtc
         }
-        Catch
+        $date = [datetime]$script:AADRRun.SnapshotUtc
+        $script:AADRRun.Status = 'Running'
+        $manifestWritable = $true
+        $script:AADRManifestWritable = $true
+        Write-AADRManifest -Required
+        $stage = 'Collection'
+        ForEach ($name in $selected)
         {
-            Write-Output "[Invoke-AzureADRecon] $($_.Exception.Message)"
+            Write-Host "[-] $name"
+            Invoke-AADRCollectorRun -Name $name -Query $registry[$name] -OutputDirectory $AADROutputDir -Formats $formats -Resume:$Resume
         }
-        If ($SaveVerbosePreference)
+        $totalTime = '{0:N2}' -f (([DateTime]::UtcNow - [datetime]$script:AADRRun.StartedUtc).TotalMinutes)
+        $stage = 'Report generation'
+        $about = @(Invoke-AADRReportStep -Name 'Run attribution' -Query { Get-AADRAbout -Method MSGraph -date $date -AzureADReconVersion '2.0' -RanonComputer ([Environment]::MachineName) -TotalTime $totalTime })
+        If ($about.Count -gt 0)
         {
-            $script:VerbosePreference = $SaveVerbosePreference
-            Remove-Variable SaveVerbosePreference
+            ForEach ($format in $formats | Where-Object { $_ -ne 'EXCEL' })
+            { Invoke-AADRReportStep -Name ('About ' + $format) -Query { Export-ADR -ADRObj $about -AADROutputDir $AADROutputDir -OutputType @($format) -ADRModuleName AboutAzureADRecon } }
         }
-
-        switch ($computerdomainrole)
+        If ($formats -contains 'HTML') { Invoke-AADRReportStep -Name 'HTML index' -Query { Export-ADRHTML -ADRObj ([pscustomobject]@{}) -ADFileName (Join-AADRPath @($AADROutputDir,'HTML-Files','Index.html')) -AADROutputDir $AADROutputDir } }
+        If ($formats -contains 'EXCEL')
         {
-            0
-            {
-                [string] $computerrole = "Standalone Workstation"
-            }
-            1 { [string] $computerrole = "Member Workstation" }
-            2
-            {
-                [string] $computerrole = "Standalone Server"
-            }
-            3 { [string] $computerrole = "Member Server" }
-            4 { [string] $computerrole = "Backup Domain Controller" }
-            5 { [string] $computerrole = "Primary Domain Controller" }
-            default { Write-Output "Computer Role could not be identified." }
+            Invoke-AADRReportStep -Name Excel -Query { Export-ADRExcel -ExcelPath $AADROutputDir -Logo $Logo }
         }
-
-        $RanonComputer = "$($computer.domain)\$([Environment]::MachineName) - $($computerrole)"
-        Remove-Variable computer
-        Remove-Variable computerdomainrole
-        Remove-Variable computerrole
-    }
-
-    # Compile C# code
-    # Suppress Debug output
-    $SaveDebugPreference = $script:DebugPreference
-    $script:DebugPreference = 'SilentlyContinue'
-    Try
-    {
-        If ($Method -eq 'MSGraph')
-        {
-            #$AzureADModulePath = (Get-Module -ListAvailable AzureAD).path | Split-Path
-            $CLR = ([System.Reflection.Assembly]::GetExecutingAssembly().ImageRuntimeVersion)[1]
-            If ($PSVersionTable.PSEdition -eq "Core")
-            {
-                $refFolder = Join-Path -Path (Split-Path([PSObject].Assembly.Location)) -ChildPath "ref"
-                Add-Type -TypeDefinition $($MSGraphSource) -ReferencedAssemblies ([System.String[]]@(
-                    (Join-Path -Path $refFolder -ChildPath "System.Collections.dll")
-                    (Join-Path -Path $refFolder -ChildPath "System.Collections.NonGeneric.dll")
-                    (Join-Path -Path $refFolder -ChildPath "System.Threading.dll")
-                    (Join-Path -Path $refFolder -ChildPath "System.Threading.Thread.dll")
-                    (Join-Path -Path $refFolder -ChildPath "mscorlib.dll")
-                    #([System.Reflection.Assembly]::LoadWithPartialName("mscorlib")).Location
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.Linq")).Location
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.Console")).Location
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.ComponentModel.DataAnnotations")).Location
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.Management.Automation")).Location
-                    ))
-                Remove-Variable refFolder
-            }
-            If ($CLR -eq "4")
-            {
-                Add-Type -TypeDefinition $($MSGraphSource) -ReferencedAssemblies ([System.String[]]@(
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.ComponentModel.DataAnnotations")).Location
-                    ))
-            }
-            Else
-            {
-                Add-Type -TypeDefinition $($MSGraphSource) -ReferencedAssemblies ([System.String[]]@(
-                    ([System.Reflection.Assembly]::LoadWithPartialName("System.ComponentModel.DataAnnotations")).Location
-                    ))
-            }
-            #Remove-Variable AzureADModulePath
-            Remove-Variable CLR
-        }
+        $script:AADRRun.Status = If (@($script:AADRRun.Collectors | Where-Object Status -notin @('Success','Empty')).Count -gt 0 -or @($script:AADRRun.Events | Where-Object Status -in @('ExportFailed','ManifestFailed','CheckpointFailed','CleanupFailed')).Count -gt 0) { 'Partial' } Else { 'Success' }
+        Write-Host "Output directory: $AADROutputDir"
     }
     Catch
     {
-        Write-Output "[Invoke-AzureADRecon] $($_.Exception.Message)"
-        Return $null
+        $diagnostic = Get-AADRErrorDiagnostic $_
+        $script:AADRLastFailure = [pscustomobject]@{Stage=$stage; Diagnostic=$diagnostic}
+        If ($script:AADRRun) { $script:AADRRun.Status = 'Failed'; Add-AADREvent -Operation Run -Status Failed -Detail ("Run stopped during $stage. Completed collector checkpoints are retained.") -Diagnostic $diagnostic }
+        If (Test-AADRGraphAuthenticationError -Record $_) { Stop-AADRGraphAuthentication -Record $_ }
+        throw
     }
-    If ($SaveDebugPreference)
+    Finally
     {
-        $script:DebugPreference = $SaveDebugPreference
-        Remove-Variable SaveDebugPreference
-    }
-
-    Write-Output "[*] Running on $RanonComputer"
-
-    Switch ($Collect)
-    {
-        'Tenant' { $AADRTenant = $true }
-        'Domain' {$AADRDomain = $true }
-        'Licenses' { $AADRLicenses = $true }
-        'Users' { $AADRUsers = $true }
-        'ServicePrincipals'{ $AADRServicePrincipals = $true }
-        'DirectoryRoles' { $AADRDirectoryRoles = $true }
-        'DirectoryRoleMembers' { $AADRDirectoryRoleMembers = $true }
-        'Groups' { $AADRGroups = $true }
-        'GroupMembers' { $AADRGroupMembers = $true }
-        'Devices' { $AADRDevices = $true }
-        'ConditionalAccessPolicies' { $AADRConditionalAccessPolicies = $true }
-        'Default'
+        If ($connectionAttempted) { Disconnect-AADRGraphSession }
+        Try { Set-Location -LiteralPath $returndir -ErrorAction Stop }
+        Catch { $script:AADRCleanupFailed=$true; Add-AADREvent -Operation Cleanup -Status CleanupFailed -Detail 'Could not restore the working directory.' -Diagnostic (Get-AADRErrorDiagnostic $_); Write-Warning '[Cleanup] Could not restore the working directory.' -WarningAction Continue }
+        Try
         {
-            $AADRTenant = $true
-            $AADRDomain = $true
-            $AADRLicenses = $true
-            $AADRUsers = $true
-            $AADRServicePrincipals = $true
-            $AADRDirectoryRoles = $true
-            $AADRDirectoryRoleMembers = $true
-            $AADRGroups = $true
-            $AADRGroupMembers = $true
-            $AADRDevices = $true
-            $AADRConditionalAccessPolicies = $true
-
-            If ($OutputType -eq "Default")
+        If ($script:AADRRun -and $manifestWritable)
+        {
+            ForEach ($name in $selected)
             {
-                [array] $OutputType = "CSV","Excel"
+                If (@($script:AADRRun.Collectors | Where-Object Name -eq $name).Count -eq 0)
+                { $script:AADRRun.Collectors.Add([pscustomobject]@{Name=$name;Status='NotStarted';DataStatus='NotStarted';RowCount=$null;StartedUtc=$null;FinishedUtc=$null;Checkpoint=$null;CheckpointHash=$null;Resumed=$false;Exports=@();Error=$null}) }
             }
+            $script:AADRRun.FinishedUtc = [DateTime]::UtcNow.ToString('o')
+            If ($script:AADRRun.Status -eq 'Success' -and @($script:AADRRun.Events | Where-Object Status -in @('CleanupFailed','ManifestFailed')).Count -gt 0) { $script:AADRRun.Status = 'Partial' }
+            Write-AADRManifest
+            # The final write itself can be the first I/O failure.
+            If ($script:AADRRun.Status -eq 'Success' -and $script:AADRManifestFailureRecorded) { $script:AADRRun.Status = 'Partial' }
+        }
+        }
+        Finally
+        {
+            $script:AADRCurrentCollector = $null
+            $script:AADRTokenSession = $null
+            Write-Progress -Activity 'AzureADRecon' -Completed -ErrorAction SilentlyContinue
         }
     }
+}
 
-    Switch ($OutputType)
-    {
-        'STDOUT' { $AADRSTDOUT = $true }
-        'CSV'
-        {
-            $AADRCSV = $true
-            $AADRCreate = $true
-        }
-        'XML'
-        {
-            $AADRXML = $true
-            $AADRCreate = $true
-        }
-        'JSON'
-        {
-            $AADRJSON = $true
-            $AADRCreate = $true
-        }
-        'HTML'
-        {
-            $AADRHTML = $true
-            $AADRCreate = $true
-        }
-        'Excel'
-        {
-            $AADRExcel = $true
-            $AADRCreate = $true
-        }
-        'All'
-        {
-            #$ADRSTDOUT = $true
-            $AADRCSV = $true
-            $AADRXML = $true
-            $AADRJSON = $true
-            $AADRHTML = $true
-            $AADRExcel = $true
-            $AADRCreate = $true
-            [array] $OutputType = "CSV","XML","JSON","HTML","Excel"
-        }
-        'Default'
-        {
-            [array] $OutputType = "STDOUT"
-            $AADRSTDOUT = $true
-        }
-    }
-
-    If ( ($AADRExcel) -and (-Not $AADRCSV) )
-    {
-        $AADRCSV = $true
-        [array] $OutputType += "CSV"
-    }
-
-    $returndir = Get-Location
-    $date = Get-Date
-
-    # Create Output dir
-    If ( ($AADROutputDir) -and ($AADRCreate) )
-    {
-        If (!(Test-Path $AADROutputDir))
-        {
-            New-Item $AADROutputDir -type directory | Out-Null
-            If (!(Test-Path $AADROutputDir))
-            {
-                Write-Output "[Invoke-AzureADRecon] Error, invalid OutputDir Path ... Exiting"
-                Return $null
-            }
-        }
-        $AADROutputDir = $((Convert-Path $AADROutputDir).TrimEnd("\"))
-        Write-Verbose "[*] Output Directory: $AADROutputDir"
-    }
-    ElseIf ($AADRCreate)
-    {
-        $AADROutputDir =  -join($returndir,'\','AzureADRecon-Report-',$(Get-Date -UFormat %Y%m%d%H%M%S))
-        New-Item $AADROutputDir -type directory | Out-Null
-        If (!(Test-Path $AADROutputDir))
-        {
-            Write-Output "[Invoke-AzureADRecon] Error, could not create output directory"
-            Return $null
-        }
-        $AADROutputDir = $((Convert-Path $AADROutputDir).TrimEnd("\"))
-        Remove-Variable AADRCreate
-    }
-    Else
-    {
-        $AADROutputDir = $returndir
-    }
-
-    If ($AADRCSV)
-    {
-        $CSVPath = [System.IO.DirectoryInfo] -join($AADROutputDir,'\','CSV-Files')
-        New-Item $CSVPath -type directory | Out-Null
-        If (!(Test-Path $CSVPath))
-        {
-            Write-Output "[Invoke-AzureADRecon] Error, could not create output directory"
-            Return $null
-        }
-        Remove-Variable AADRCSV
-    }
-
-    If ($AADRXML)
-    {
-        $XMLPath = [System.IO.DirectoryInfo] -join($AADROutputDir,'\','XML-Files')
-        New-Item $XMLPath -type directory | Out-Null
-        If (!(Test-Path $XMLPath))
-        {
-            Write-Output "[Invoke-AzureADRecon] Error, could not create output directory"
-            Return $null
-        }
-        Remove-Variable AADRXML
-    }
-
-    If ($AADRJSON)
-    {
-        $JSONPath = [System.IO.DirectoryInfo] -join($AADROutputDir,'\','JSON-Files')
-        New-Item $JSONPath -type directory | Out-Null
-        If (!(Test-Path $JSONPath))
-        {
-            Write-Output "[Invoke-AzureADRecon] Error, could not create output directory"
-            Return $null
-        }
-        Remove-Variable AADRJSON
-    }
-
-    If ($AADRHTML)
-    {
-        $HTMLPath = [System.IO.DirectoryInfo] -join($AADROutputDir,'\','HTML-Files')
-        New-Item $HTMLPath -type directory | Out-Null
-        If (!(Test-Path $HTMLPath))
-        {
-            Write-Output "[Invoke-AzureADRecon] Error, could not create output directory"
-            Return $null
-        }
-        Remove-Variable AADRHTML
-    }
-
-    # AzureAD Login
-    If ($Method -eq 'MSGraph')
+$transcribing = $false
+$transcriptStartFailure = $null
+$script:AADRExitCode = 0
+Try
+{
+    If ($Log)
     {
         Try
         {
-            Write-Output "[Invoke-AzureADRecon] MSGraph Module is installed. Logging in ..."
-
-            $Scopes = "AuditLog.Read.All, User.Read.All, UserAuthenticationMethod.Read.All, Policy.Read.All, Directory.Read.All"
-
-            $ADFileName = -join ($returndir, '\', 'MSGraph-Credentials.csv')
-            If (Test-Path $ADFileName)
-            {
-                $CredsObj = Import-CSV -Path $ADFileName
-                Remove-Variable ADFileName
-                ForEach ($row in $CredsObj)
-                {
-                    Switch ($row.Category)
-                    {
-                        'TenantID' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($TenantID)) { $TenantID = $row.Value } }
-                        'ClientID' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $ClientID = $row.Value } }
-                        'ClientSecret' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $ClientSecret = $row.Value; $HasClientSecret = $true } }
-                        'AccessToken' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($AccessToken)) { $AccessToken = $row.Value } }
-                        'SeamlessSSO' { If (($row.Value -eq 'true' -or $row.Value -eq '1') -and -Not $SeamlessSSO) { $SeamlessSSO = $true } }
-                        'Domain' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($Domain)) { $Domain = $row.Value } }
-                        'DC' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($DC)) { $DC = $row.Value } }
-                        'TGT' { If (-Not [string]::IsNullOrEmpty($row.Value) -and [string]::IsNullOrEmpty($TGT)) { $TGT = $row.Value } }
-                        'CertificateThumbprint' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $CertificateThumbprint = $row.Value; $CertThumbprint = $true } }
-                        'CertificateName' { If (-Not [string]::IsNullOrEmpty($row.Value)) { $CertificateName = $row.Value; $CertName = $true } }
-                        'Certificate' {
-                            If (-Not [string]::IsNullOrEmpty($row.Value)) {
-                                $Certificate = Get-ChildItem "Cert:\LocalMachine\My\$($row.Value)"
-                                $CertAuth = $true
-                            }
-                        }
-                    }
-                }
-
-                # Backwards-compatibility for older CSV format by index if Category didn't match
-                If ([string]::IsNullOrEmpty($ClientSecret) -and $CredsObj.Count -gt 2 -and (-Not [string]::IsNullOrEmpty($CredsObj[2].Value)) -and $CredsObj[2].Category -eq 'ClientSecret')
-                {
-                    $ClientSecret = $CredsObj[2].Value
-                    $HasClientSecret = $true
-                }
-                Remove-Variable CredsObj
-            }
-
-            If ($SeamlessSSO)
-            {
-                $ssoToken = Get-AADRSeamlessSSOToken -TenantID $TenantID -Domain $Domain -DC $DC -TGT $TGT
-                If ($ssoToken)
-                {
-                    $AccessToken = $ssoToken
-                }
-                Else
-                {
-                    Write-Warning "[Invoke-AzureADRecon] Could not acquire Seamless SSO token ... Exiting"
-                    Return $null
-                }
-            }
-
-            If ($AccessToken)
-            {
-                Write-Output "[Invoke-AzureADRecon] Connecting to Microsoft Graph using AccessToken..."
-                If ($AccessToken -is [System.Security.SecureString])
-                {
-                    $secAccessToken = $AccessToken
-                }
-                Else
-                {
-                    $secAccessToken = ConvertTo-SecureString -String ([string]$AccessToken) -AsPlainText -Force
-                }
-                Connect-MgGraph -AccessToken $secAccessToken -NoWelcome | Out-Null
-                Remove-Variable AccessToken
-                Remove-Variable secAccessToken
-            }
-            ElseIf ($HasClientSecret)
-            {
-                Write-Output "[Invoke-AzureADRecon] Connecting to Microsoft Graph using ClientSecret..."
-                [SecureString]$secStringClientSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-                [PSCredential]$ClientSecretCredential = New-Object System.Management.Automation.PSCredential ($ClientID, $secStringClientSecret)
-                Connect-MgGraph -TenantId $TenantID -ClientSecretCredential $ClientSecretCredential -NoWelcome | Out-Null
-                Remove-Variable ClientID
-                Remove-Variable ClientSecret
-                Remove-Variable HasClientSecret
-                Remove-Variable secStringClientSecret
-                Remove-Variable ClientSecretCredential
-            }
-            ElseIf ($CertThumbprint)
-            {
-                Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -CertificateThumbprint $CertificateThumbprint -Scopes $Scopes | Out-Null
-                Remove-Variable ClientID
-                Remove-Variable CertificateThumbprint
-                Remove-Variable CertThumbprint
-            }
-            ElseIf ($CertName)
-            {
-                Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -CertificateName $CertificateName -Scopes $Scopes | Out-Null
-                Remove-Variable ClientID
-                Remove-Variable CertificateName
-                Remove-Variable CertName
-            }
-            ElseIf ($CertAuth)
-            {
-                Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -Certificate $Certificate -Scopes $Scopes | Out-Null
-                Remove-Variable ClientID
-                Remove-Variable Certificate
-                Remove-Variable CertAuth
-            }
-            ElseIf ($TenantID)
-            {
-                Connect-MgGraph -TenantID $TenantID -Scopes $Scopes | Out-Null
-            }
-            Else
-            {
-                Connect-MgGraph -Scopes $Scopes | Out-Null
-            }
-            Remove-Variable Scopes
-
-            If (-Not (Get-MgContext))
-            {
-                Write-Warning "[Invoke-AzureADRecon] Error authenticating to AzureAD ... Exiting"
-                Return $null
-            }
-
+            Start-Transcript -Path (Join-Path (Get-Location) 'AzureADRecon-Console-Log.txt') -ErrorAction Stop | Out-Null
+            $transcribing = $true
         }
         Catch
         {
-            Write-Warning "[Invoke-AzureADRecon] Error authenticating to AzureAD ... Exiting"
-            Write-Verbose "[EXCEPTION] $($_.Exception.Message)"
-            Remove-EmptyAADROutputDir $AADROutputDir $OutputType
-            Return $null
+            If (Test-AADRControlFlowError $_) { throw }
+            $transcriptStartFailure = Get-AADRErrorDiagnostic $_
+            Write-Warning '[Transcript] Console logging could not start. Collection will continue; check the log path and file permissions.' -WarningAction Continue
         }
     }
-
-    Write-Output "[*] Commencing - $date"
-    If ($AADRTenant)
-    {
-        Write-Output "[-] Tenant"
-        $AADRObject = Get-AADRTenant -Method $Method -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Tenant"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRTenant
-    }
-    If ($AADRDomain)
-    {
-        Write-Output "[-] Domain"
-        $AADRObject = Get-AADRDomain -Method $Method -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Domain"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRDomain
-    }
-    If ($AADRLicenses)
-    {
-        Write-Output "[-] Licenses"
-        $AADRObject = Get-AADRLicense -Method $Method -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Licenses"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRLicenses
-    }
-    If ($AADRUsers)
-    {
-        Write-Output "[-] Users - May take some time"
-        $AADRObject = Get-AADRUser -Method $Method -date $date -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Users"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRUsers
-    }
-    If ($AADRServicePrincipals)
-    {
-        Write-Output "[-] Service Principals - May take some time"
-        $AADRObject = Get-AADRServicePrincipal -Method $Method -date $date -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "ServicePrincipals"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRServicePrincipals
-    }
-    If ($AADRDirectoryRoles)
-    {
-        Write-Output "[-] Directory Role"
-        $AADRObject = Get-AADRDirectoryRole -Method $Method -PageSize $PageSize -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "DirectoryRoles"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRDirectoryRoles
-    }
-    If ($AADRDirectoryRoleMembers)
-    {
-        Write-Output "[-] Directory Role Membership - May take some time"
-        $AADRObject = Get-AADRDirectoryRoleMember -Method $Method -PageSize $PageSize -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "DirectoryRoleMembers"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRDirectoryRoleMembers
-    }
-    If ($AADRGroups)
-    {
-        Write-Output "[-] Groups - May take some time"
-        $AADRObject = Get-AADRGroup -Method $Method -date $date -PageSize $PageSize -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Groups"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRGroups
-    }
-    If ($AADRGroupMembers)
-    {
-        Write-Output "[-] Group Membership - May take some time"
-        $AADRObject = Get-AADRGroupMember -Method $Method -PageSize $PageSize -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "GroupMembers"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRGroupMembers
-    }
-    If ($AADRDevices)
-    {
-        Write-Output "[-] Devices - May take some time"
-        $AADRObject = Get-AADRDevice -Method $Method -Threads $Threads
-        If ($AADRObject)
-        {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "Devices"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRDevices
-    }
-
-    If ($AADRConditionalAccessPolicies) {
-        Write-Output "[-] Conditional Access Policies"
-        $AADRObject = Get-AADRConditionalAccessPolicy -Method $Method
-        If ($AADRObject) {
-            Export-ADR -ADRObj $AADRObject -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "ConditionalAccessPolicies"
-            Remove-Variable AADRObject
-        }
-        Remove-Variable AADRConditionalAccessPolicies
-    }
-
-    $TotalTime = "{0:N2}" -f ((Get-DateDiff -Date1 (Get-Date) -Date2 $date).TotalMinutes)
-
-    $AboutAzureADRecon = Get-AADRAbout -Method $Method -date $date -AzureADReconVersion $AzureADReconVersion -Credential $Credential -RanonComputer $RanonComputer -TotalTime $TotalTime
-
-    If ( ($OutputType -Contains "CSV") -or ($OutputType -Contains "XML") -or ($OutputType -Contains "JSON") -or ($OutputType -Contains "HTML") )
-    {
-        If ($AboutAzureADRecon)
-        {
-            Export-ADR -ADRObj $AboutAzureADRecon -AADROutputDir $AADROutputDir -OutputType $OutputType -ADRModuleName "AboutAzureADRecon"
-        }
-        Write-Output "[*] Total Execution Time (mins): $($TotalTime)"
-        Write-Output "[*] Output Directory: $AADROutputDir"
-        $ADRSTDOUT = $false
-    }
-
-    Switch ($OutputType)
-    {
-        'STDOUT'
-        {
-            If ($ADRSTDOUT)
-            {
-                Write-Output "[*] Total Execution Time (mins): $($TotalTime)"
-            }
-        }
-        'HTML'
-        {
-            Export-ADR -ADRObj $(New-Object PSObject) -AADROutputDir $AADROutputDir -OutputType $([array] "HTML") -ADRModuleName "Index"
-        }
-        'EXCEL'
-        {
-            Export-ADRExcel $AADROutputDir -Logo $Logo
-        }
-    }
-    Remove-Variable TotalTime
-    Remove-Variable AboutAzureADRecon
-    Set-Location $returndir
-    Remove-Variable returndir
-
-    If ($Method -eq 'MSGraph')
-    {
-        Disconnect-MgGraph | Out-Null
-    }
-
-    If ($AADROutputDir)
-    {
-        Remove-EmptyAADROutputDir $AADROutputDir $OutputType
-    }
-
-    Remove-Variable AzureADReconVersion
-    Remove-Variable RanonComputer
+    Invoke-AzureADRecon -GenExcel $GenExcel -Method $Method -Collect $Collect -Credential $Credential -AccessToken $AccessToken -AccessTokenProvider $AccessTokenProvider -AccessTokenExpiresOn $AccessTokenExpiresOn -TokenRefreshWindowSeconds $TokenRefreshWindowSeconds -SeamlessSSO:$SeamlessSSO -TenantID $TenantID -ClientID $ClientID -Domain $Domain -DC $DC -TGT $TGT -Resume:$Resume -OutputType $OutputType -AADROutputDir $OutputDir -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads -Logo $Logo
 }
-
-If ($Log)
+Catch
 {
-    Start-Transcript -Path "$(Get-Location)\AzureADRecon-Console-Log.txt"
+    If (Test-AADRControlFlowError $_) { throw }
+    $script:AADRExitCode = 1
+    $failure = $script:AADRLastFailure
+    $diagnostic = If ($failure) { $failure.Diagnostic } Else { Get-AADRErrorDiagnostic $_ }
+    $stage = If ($failure) { $failure.Stage } Else { 'Startup' }
+    $check = If ($diagnostic.Operation) { $diagnostic.Operation } Else { $stage }
+    $status = If ($diagnostic.HttpStatus) { 'HTTP ' + $diagnostic.HttpStatus } Else { 'no HTTP status' }
+    Write-Warning "[AzureADRecon] Stopped during $stage at $check ($($diagnostic.Category), $($diagnostic.Code), $($diagnostic.Reason), $status). $($diagnostic.Guidance) Check CollectionManifest.json when available. Completed report files are retained." -WarningAction Continue
 }
-
-#$Credential = New-Object System.Management.Automation.PSCredential ("Username", $(ConvertTo-SecureString "Password" -AsPlainText -Force))
-
-Invoke-AzureADRecon -GenExcel $GenExcel -Method $Method -Collect $Collect -Credential $Credential -AccessToken $AccessToken -SeamlessSSO:$SeamlessSSO -TenantID $TenantID -Domain $Domain -DC $DC -TGT $TGT -OutputType $OutputType -AADROutputDir $OutputDir -DormantTimeSpan $DormantTimeSpan -PassMaxAge $PassMaxAge -PageSize $PageSize -Threads $Threads -Logo $Logo
-
-If ($Log)
+Finally
 {
-    Stop-Transcript
+    If ($transcriptStartFailure)
+    { Add-AADREvent -Operation Transcript -Status LoggingFailed -Detail 'Console transcript could not start; collection proceeded without it.' -Diagnostic $transcriptStartFailure }
+    If ($transcribing)
+    {
+        Try { Stop-Transcript -ErrorAction Stop | Out-Null }
+        Catch
+        {
+            $script:AADRCleanupFailed = $true
+            Add-AADREvent -Operation Transcript -Status CleanupFailed -Detail 'Console transcript could not be stopped.' -Diagnostic (Get-AADRErrorDiagnostic $_)
+            Write-Warning '[Transcript] Console logging could not be stopped cleanly.' -WarningAction Continue
+        }
+    }
+    If ($script:AADRRun -and $script:AADRManifestWritable)
+    {
+        If ($script:AADRRun.Status -eq 'Success' -and @($script:AADRRun.Events | Where-Object Status -in @('LoggingFailed','CleanupFailed','ManifestFailed')).Count -gt 0) { $script:AADRRun.Status = 'Partial' }
+        Write-AADRManifest
+        If ($script:AADRRun.Status -eq 'Success' -and $script:AADRManifestFailureRecorded) { $script:AADRRun.Status = 'Partial' }
+    }
+    If ($script:AADRExitCode -eq 0 -and (($script:AADRRun -and $script:AADRRun.Status -eq 'Partial') -or $script:AADRExcelFailed -or $script:AADRCleanupFailed -or $transcriptStartFailure)) { $script:AADRExitCode = 2 }
 }
+# Keep interactive dot-sourcing usable; CLI and & invocation expose a meaningful exit code.
+If ($MyInvocation.InvocationName -ne '.') { exit $script:AADRExitCode }

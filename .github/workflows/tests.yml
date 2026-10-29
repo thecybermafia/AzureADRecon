@@ -1,0 +1,26 @@
+name: PowerShell regression tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  powershell-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline regression suites
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 regression suites
+        shell: powershell
+        run: ./tests/Run-Tests.ps1
